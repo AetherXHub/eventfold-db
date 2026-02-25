@@ -1,5 +1,7 @@
 # PRD 002: On-Disk Format (Record Codec)
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Implement the binary serialization and deserialization layer for the append-only log file. This includes the file header format, individual record encoding/decoding, and CRC32 integrity checking. This module is pure data transformation -- no file I/O, no async, no index management.
