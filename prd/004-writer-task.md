@@ -1,5 +1,7 @@
 # PRD 004: Writer Task
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Implement the async single-writer task that serializes all write operations through a `tokio::mpsc` channel. gRPC handlers never touch the log file or index directly -- they send append requests to the writer task, which processes them sequentially, ensuring durability (fsync) and correctness (no concurrent mutations). The writer responds to each caller via a `tokio::oneshot` channel.

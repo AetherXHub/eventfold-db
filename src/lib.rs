@@ -2,15 +2,19 @@
 
 pub mod codec;
 pub mod error;
+pub mod reader;
 pub mod store;
 pub mod types;
+pub mod writer;
 
 pub use codec::DecodeOutcome;
 pub use error::Error;
+pub use reader::ReadIndex;
 pub use store::Store;
 pub use types::{
     ExpectedVersion, MAX_EVENT_SIZE, MAX_EVENT_TYPE_LEN, ProposedEvent, RecordedEvent,
 };
+pub use writer::{WriterHandle, spawn_writer};
 
 #[cfg(test)]
 mod tests {

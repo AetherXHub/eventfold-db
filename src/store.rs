@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use uuid::Uuid;
 
@@ -38,26 +39,37 @@ fn has_valid_record_after(data: &[u8], start: usize) -> bool {
     false
 }
 
+/// Thread-safe, read-optimized view of the event log.
+///
+/// Holds the two in-memory index structures: the global event log and the
+/// per-stream index of global positions. Wrapped in `Arc<RwLock<EventLog>>`
+/// inside `Store` so that concurrent read handlers can acquire a read lock
+/// while the writer task holds an exclusive write lock for index updates.
+#[derive(Debug)]
+pub struct EventLog {
+    /// Global event log. Append-only -- new events are pushed to the end.
+    /// Index `i` = event at global position `i`.
+    pub events: Vec<RecordedEvent>,
+    /// Stream index. Maps stream ID to list of global positions.
+    /// Index `j` in the vec = event at stream version `j`.
+    pub streams: HashMap<Uuid, Vec<u64>>,
+}
+
 /// Core storage engine that manages the append-only log file and in-memory index.
 ///
-/// The `Store` owns the file handle for the log file and maintains two in-memory
-/// data structures:
-///
-/// - `events`: A global log where index `i` is the event at global position `i`.
-/// - `streams`: A map from stream UUID to a list of global positions, where
-///   index `j` is the event at stream version `j`.
+/// The `Store` owns the file handle for the log file and a shared
+/// `Arc<RwLock<EventLog>>` that holds the in-memory index structures.
 ///
 /// All writes go through `append()`, which validates concurrency, serializes
-/// records to disk, fsyncs, and updates the index. Reads go directly to the
-/// in-memory index with no disk I/O.
+/// records to disk, fsyncs, then acquires the write lock to update the index.
+/// Reads acquire a read lock and go directly to the in-memory index with no
+/// disk I/O. The `Arc<RwLock<EventLog>>` can be cloned via `Store::log()` for
+/// use by `ReadIndex` handles.
 pub struct Store {
     /// Append-only log file handle.
     file: File,
-    /// Global event log. Index `i` = event at global position `i`.
-    events: Vec<RecordedEvent>,
-    /// Stream index. Maps stream ID to list of global positions.
-    /// Index `j` in the vec = event at stream version `j`.
-    streams: HashMap<Uuid, Vec<u64>>,
+    /// Shared in-memory event log, protected by a read-write lock.
+    log: Arc<RwLock<EventLog>>,
 }
 
 impl Store {
@@ -103,8 +115,10 @@ impl Store {
 
             return Ok(Store {
                 file,
-                events: Vec::new(),
-                streams: HashMap::new(),
+                log: Arc::new(RwLock::new(EventLog {
+                    events: Vec::new(),
+                    streams: HashMap::new(),
+                })),
             });
         }
 
@@ -170,8 +184,7 @@ impl Store {
 
                     return Ok(Store {
                         file,
-                        events,
-                        streams,
+                        log: Arc::new(RwLock::new(EventLog { events, streams })),
                     });
                 }
                 Err(e) => return Err(e),
@@ -183,8 +196,7 @@ impl Store {
 
         Ok(Store {
             file,
-            events,
-            streams,
+            log: Arc::new(RwLock::new(EventLog { events, streams })),
         })
     }
 
@@ -202,7 +214,8 @@ impl Store {
     ///
     /// `Some(version)` if the stream exists, `None` otherwise.
     pub fn stream_version(&self, stream_id: &Uuid) -> Option<u64> {
-        self.streams
+        let log = self.log.read().expect("EventLog RwLock poisoned");
+        log.streams
             .get(stream_id)
             .map(|positions| positions.len() as u64 - 1)
     }
@@ -216,7 +229,8 @@ impl Store {
     ///
     /// The number of events in the global log.
     pub fn global_position(&self) -> u64 {
-        self.events.len() as u64
+        let log = self.log.read().expect("EventLog RwLock poisoned");
+        log.events.len() as u64
     }
 
     /// Read events from the global log starting at a given position.
@@ -235,10 +249,11 @@ impl Store {
     /// A `Vec<RecordedEvent>` containing the requested events. Returns an empty
     /// vec if `from_position >= events.len()`.
     pub fn read_all(&self, from_position: u64, max_count: u64) -> Vec<RecordedEvent> {
-        let len = self.events.len() as u64;
+        let log = self.log.read().expect("EventLog RwLock poisoned");
+        let len = log.events.len() as u64;
         let start = from_position.min(len);
         let end = from_position.saturating_add(max_count).min(len);
-        self.events[start as usize..end as usize].to_vec()
+        log.events[start as usize..end as usize].to_vec()
     }
 
     /// Read events from a specific stream starting at a given version.
@@ -266,7 +281,8 @@ impl Store {
         from_version: u64,
         max_count: u64,
     ) -> Result<Vec<RecordedEvent>, Error> {
-        let positions = self
+        let log = self.log.read().expect("EventLog RwLock poisoned");
+        let positions = log
             .streams
             .get(&stream_id)
             .ok_or(Error::StreamNotFound { stream_id })?;
@@ -277,7 +293,7 @@ impl Store {
 
         Ok(positions[start as usize..end as usize]
             .iter()
-            .map(|&global_pos| self.events[global_pos as usize].clone())
+            .map(|&global_pos| log.events[global_pos as usize].clone())
             .collect())
     }
 
@@ -313,42 +329,50 @@ impl Store {
         expected_version: ExpectedVersion,
         proposed_events: Vec<ProposedEvent>,
     ) -> Result<Vec<RecordedEvent>, Error> {
-        // Step 1: Validate expected version against current stream state.
-        let stream_positions = self.streams.get(&stream_id);
-        match expected_version {
-            ExpectedVersion::Any => {} // always passes
-            ExpectedVersion::NoStream => {
-                if let Some(positions) = stream_positions {
-                    let actual_version = positions.len() as u64 - 1;
-                    return Err(Error::WrongExpectedVersion {
-                        expected: "NoStream".to_string(),
-                        actual: actual_version.to_string(),
-                    });
-                }
-            }
-            ExpectedVersion::Exact(n) => match stream_positions {
-                None => {
-                    return Err(Error::WrongExpectedVersion {
-                        expected: n.to_string(),
-                        actual: "NoStream".to_string(),
-                    });
-                }
-                Some(positions) => {
-                    let current_version = positions.len() as u64 - 1;
-                    if current_version != n {
+        // Step 1: Acquire a read lock to validate expected version and compute
+        // starting positions. The read lock is held only for validation and
+        // position computation, not during disk I/O.
+        let (mut next_global, mut next_stream_version) = {
+            let log = self.log.read().expect("EventLog RwLock poisoned");
+            let stream_positions = log.streams.get(&stream_id);
+
+            match expected_version {
+                ExpectedVersion::Any => {} // always passes
+                ExpectedVersion::NoStream => {
+                    if let Some(positions) = stream_positions {
+                        let actual_version = positions.len() as u64 - 1;
                         return Err(Error::WrongExpectedVersion {
-                            expected: n.to_string(),
-                            actual: current_version.to_string(),
+                            expected: "NoStream".to_string(),
+                            actual: actual_version.to_string(),
                         });
                     }
                 }
-            },
-        }
+                ExpectedVersion::Exact(n) => match stream_positions {
+                    None => {
+                        return Err(Error::WrongExpectedVersion {
+                            expected: n.to_string(),
+                            actual: "NoStream".to_string(),
+                        });
+                    }
+                    Some(positions) => {
+                        let current_version = positions.len() as u64 - 1;
+                        if current_version != n {
+                            return Err(Error::WrongExpectedVersion {
+                                expected: n.to_string(),
+                                actual: current_version.to_string(),
+                            });
+                        }
+                    }
+                },
+            }
 
-        // Step 2: Build RecordedEvents and validate each one.
-        let mut next_global = self.events.len() as u64;
-        let mut next_stream_version = stream_positions.map(|p| p.len() as u64).unwrap_or(0);
+            let next_global = log.events.len() as u64;
+            let next_stream_version = stream_positions.map(|p| p.len() as u64).unwrap_or(0);
+            (next_global, next_stream_version)
+            // Read lock dropped here.
+        };
 
+        // Step 2: Build RecordedEvents and validate each one (no lock held).
         let mut recorded = Vec::with_capacity(proposed_events.len());
         let mut encoded_batch = Vec::new();
 
@@ -393,20 +417,36 @@ impl Store {
             next_stream_version += 1;
         }
 
-        // Step 3: Write all encoded records to disk and fsync.
+        // Step 3: Write all encoded records to disk and fsync (no lock held).
         use std::io::Seek;
         self.file.seek(std::io::SeekFrom::End(0))?;
         self.file.write_all(&encoded_batch)?;
         self.file.sync_all()?;
 
-        // Step 4: Update in-memory index.
-        let stream_entry = self.streams.entry(stream_id).or_default();
-        for event in &recorded {
-            stream_entry.push(event.global_position);
+        // Step 4: Acquire write lock to update in-memory index (after fsync).
+        {
+            let mut log = self.log.write().expect("EventLog RwLock poisoned");
+            let stream_entry = log.streams.entry(stream_id).or_default();
+            for event in &recorded {
+                stream_entry.push(event.global_position);
+            }
+            log.events.extend(recorded.clone());
         }
-        self.events.extend(recorded.clone());
 
         Ok(recorded)
+    }
+
+    /// Returns a clone of the shared `Arc<RwLock<EventLog>>`.
+    ///
+    /// This allows external components (such as `ReadIndex`) to hold a reference
+    /// to the in-memory event log for concurrent read access while the writer task
+    /// holds exclusive write access through the same `Arc`.
+    ///
+    /// # Returns
+    ///
+    /// A cloned `Arc<RwLock<EventLog>>` pointing to the same underlying event log.
+    pub fn log(&self) -> Arc<RwLock<EventLog>> {
+        Arc::clone(&self.log)
     }
 }
 
@@ -521,8 +561,9 @@ mod tests {
 
         // Verify all recovered events match originals by comparing field-by-field
         // (event_id, stream_id, stream_version, global_position, event_type, payload).
+        let log = store.log.read().expect("read lock should not be poisoned");
         for (i, expected) in events.iter().enumerate() {
-            let recovered = &store.events[i];
+            let recovered = &log.events[i];
             assert_eq!(
                 recovered.event_id, expected.event_id,
                 "event {i} event_id mismatch"
@@ -1450,6 +1491,43 @@ mod tests {
         assert_eq!(recorded[0].global_position, 3);
         assert_eq!(recorded[0].stream_version, 3);
         assert_eq!(store.global_position(), 4);
+    }
+
+    // -- Ticket 2 AC: Store::open on new path -> store.log() returns Arc with empty EventLog.
+    #[test]
+    fn log_accessor_returns_empty_event_log_on_new_store() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let store = Store::open(&path).expect("open should succeed");
+        let log = store.log();
+        let guard = log.read().expect("read lock should not be poisoned");
+
+        assert_eq!(guard.events.len(), 0);
+        assert_eq!(guard.streams.len(), 0);
+    }
+
+    // -- Ticket 2 AC: After appending one event, log() read-locked EventLog reflects it.
+    #[test]
+    fn log_accessor_reflects_appended_event() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+        let proposed = vec![make_proposed("Created", b"{}")];
+        store
+            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .expect("append should succeed");
+
+        let log = store.log();
+        let guard = log.read().expect("read lock should not be poisoned");
+
+        assert_eq!(guard.events.len(), 1);
+        assert!(
+            guard.streams.contains_key(&stream_id),
+            "streams should contain the appended stream's UUID"
+        );
     }
 
     // -- AC-1: Opening a file too short for the header returns InvalidHeader.
