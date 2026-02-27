@@ -1,4 +1,77 @@
-//! EventfoldDB: a lightweight, single-node event store for event sourcing and CQRS.
+//! EventfoldDB is a lightweight, single-node event store built for event sourcing
+//! and CQRS workloads. It provides append-only persistence of domain events with
+//! optimistic concurrency control, ordered reads by stream and globally, and
+//! catch-up-then-live subscriptions for building read models via external
+//! projection services. All writes are serialized through a single writer task
+//! that fsyncs every batch before acknowledging, ensuring durability without
+//! sacrificing simplicity.
+//!
+//! # Quick Start
+//!
+//! Open a store, spawn the writer task, and append an event:
+//!
+//! ```ignore
+//! use std::num::NonZeroUsize;
+//! use std::path::Path;
+//!
+//! use eventfold_db::{
+//!     Broker, ExpectedVersion, ProposedEvent, Store, spawn_writer,
+//! };
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), eventfold_db::Error> {
+//!     let store = Store::open(Path::new("/tmp/my-events.db"))?;
+//!     let broker = Broker::new(1024);
+//!     let (writer, _read_index, _join) = spawn_writer(
+//!         store,
+//!         256,
+//!         broker,
+//!         NonZeroUsize::new(10_000).expect("non-zero"),
+//!     );
+//!
+//!     let stream_id = uuid::Uuid::new_v4();
+//!     let event = ProposedEvent {
+//!         event_id: uuid::Uuid::new_v4(),
+//!         event_type: "OrderPlaced".to_string(),
+//!         metadata: bytes::Bytes::new(),
+//!         payload: bytes::Bytes::from_static(b"{\"item\": \"widget\"}"),
+//!     };
+//!
+//!     let recorded = writer
+//!         .append(stream_id, ExpectedVersion::NoStream, vec![event])
+//!         .await?;
+//!     assert_eq!(recorded[0].stream_version, 0);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Key Types
+//!
+//! - [`Store`] -- Storage engine that owns the append-only log file and in-memory
+//!   index. Open or create a store with [`Store::open`].
+//! - [`WriterHandle`] -- Cloneable handle for submitting append requests to the
+//!   single writer task via a bounded channel.
+//! - [`ReadIndex`] -- Shared, read-only handle to the in-memory event log for
+//!   concurrent reads without going through the writer task.
+//! - [`Broker`] -- Broadcast broker that pushes newly appended events to live
+//!   subscribers via `tokio::broadcast`.
+//! - [`ProposedEvent`] -- An event the client wants to append, carrying an
+//!   idempotency key, event type tag, metadata, and payload.
+//! - [`RecordedEvent`] -- A persisted event with server-assigned global position,
+//!   stream version, and timestamp.
+//! - [`ExpectedVersion`] -- Optimistic concurrency control: `Any`, `NoStream`,
+//!   or `Exact(version)`.
+//! - [`Error`] -- Unified error enum for all operations, with variants that map
+//!   to gRPC status codes.
+//!
+//! # Library vs Binary
+//!
+//! This crate ships both a library and a standalone server binary. The library
+//! exposes the storage engine, writer, reader, broker, and gRPC service types
+//! so they can be embedded into custom applications. The binary
+//! (`eventfold-db`) is a thin wrapper that reads configuration from the
+//! environment, opens the store, and starts the gRPC server -- suitable for
+//! running EventfoldDB as a standalone service.
 
 pub mod broker;
 pub mod codec;

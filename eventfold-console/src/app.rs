@@ -91,6 +91,8 @@ pub struct EventRecord {
     pub stream_version: u64,
     /// Zero-based position in the global log.
     pub global_position: u64,
+    /// Unix epoch milliseconds, server-assigned at append time.
+    pub recorded_at: u64,
     /// Event type tag (e.g. "OrderPlaced").
     pub event_type: String,
     /// Raw metadata bytes.
@@ -496,6 +498,7 @@ mod tests {
             stream_id: "sid".into(),
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "Test".into(),
             metadata: vec![],
             payload: vec![],
@@ -676,6 +679,7 @@ mod tests {
             stream_id: "stream-1".into(),
             stream_version: global_position,
             global_position,
+            recorded_at: 0,
             event_type: "TestEvent".into(),
             metadata: vec![],
             payload: vec![],

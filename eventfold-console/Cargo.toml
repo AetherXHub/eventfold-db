@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Interactive TUI console for browsing EventfoldDB"
 license = "MIT OR Apache-2.0"
+authors = ["Foxworks Studios"]
+repository = "https://github.com/Foxworks-Studios/eventfold-db"
+keywords = ["event-store", "event-sourcing", "cqrs", "grpc", "database"]
+categories = ["database", "asynchronous", "network-programming"]
+rust-version = "1.85"
 
 [dependencies]
 eventfold-db = { path = ".." }

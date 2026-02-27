@@ -1,5 +1,10 @@
 # EventfoldDB
 
+[![CI](https://github.com/Foxworks-Studios/eventfold-db/actions/workflows/ci.yml/badge.svg)](https://github.com/Foxworks-Studios/eventfold-db/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/eventfold-db.svg)](https://crates.io/crates/eventfold-db)
+[![docs.rs](https://docs.rs/eventfold-db/badge.svg)](https://docs.rs/eventfold-db)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+
 A lightweight, single-node event store built in Rust for event sourcing and CQRS.
 
 EventfoldDB provides the minimum viable surface for event-sourced systems: append-only persistence of domain events with optimistic concurrency, ordered reads by stream and globally, and catch-up-then-live subscriptions for building read models.
@@ -44,6 +49,16 @@ Five gRPC operations:
 - **64 KB event limit.** Events are small, structured domain facts. Large artifacts belong in external storage.
 - **UUID identifiers.** Stream IDs and event IDs are UUIDs (v4 or v7).
 
+## Library Usage
+
+Add EventfoldDB as a dependency to your project:
+
+```sh
+cargo add eventfold-db
+```
+
+Full API documentation is available on [docs.rs/eventfold-db](https://docs.rs/eventfold-db).
+
 ## Building
 
 Requires stable Rust toolchain (2024 edition).
@@ -61,6 +76,14 @@ EVENTFOLD_DATA=/path/to/log.bin \
 EVENTFOLD_LISTEN=[::]:2113 \
 EVENTFOLD_BROKER_CAPACITY=4096 \
 cargo run
+```
+
+## Console
+
+The `eventfold-console/` sub-crate provides an interactive terminal UI for inspecting and browsing a running EventfoldDB instance. Connect it to any server with the `--addr` flag:
+
+```sh
+cargo run --manifest-path eventfold-console/Cargo.toml -- --addr [::1]:2113
 ```
 
 ## Design
