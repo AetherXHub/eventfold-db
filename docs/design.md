@@ -83,6 +83,20 @@ Each record contains: a length prefix (so the reader knows how many bytes to con
 
 The format must support detection and truncation of a partial trailing record. If the process crashes mid-write, the next startup must identify the incomplete record (via a short read or CRC mismatch at the tail), truncate it, and proceed. This is the critical correctness property that separates "works on the happy path" from "trustworthy."
 
+### Filesystem Assumptions
+
+EventfoldDB's durability model depends on specific filesystem behavior. The supported and tested configuration is **ext4 with `data=ordered` journaling mode**, which is the default on most Linux distributions.
+
+**`data=ordered` guarantee.** In `data=ordered` mode, ext4 writes file data to disk before committing the corresponding inode metadata to the journal. This means that after a `File::sync_all()` returns successfully, the written data is durable on the storage device. There is no risk of a post-crash state where the inode indicates a larger file size but the data blocks contain stale or zero-filled content. This property makes a single `File::sync_all()` call sufficient for data durability after a write.
+
+**`File::sync_all()` semantics.** All fsync calls in EventfoldDB use Rust's `File::sync_all()`, which maps to the `fsync(2)` system call on Linux. `fsync(2)` flushes both file data and file metadata (size, timestamps, allocation) to the storage device. EventfoldDB does not use `fdatasync(2)` (Rust's `File::sync_data()`), which may skip the metadata flush. Using `fsync(2)` ensures that the file's size is always consistent with its data after a crash.
+
+**Directory fsync on new file creation.** When EventfoldDB creates a new log file, it fsyncs the parent directory after fsyncing the file itself. On ext4, fsyncing a file makes the file's data and inode durable, but does not guarantee that the directory entry (the name-to-inode link) is committed. Without a directory fsync, a crash between file creation and the next directory journal commit could leave the file inaccessible on restart — the data exists on disk but the directory does not reference it. The directory fsync is only required on initial file creation, not on every append.
+
+**Unsupported filesystems.** Network-attached and distributed filesystems — including NFS, CIFS, and FUSE-based filesystems — are explicitly not supported. These filesystems may implement `fsync` semantics that diverge from POSIX requirements (e.g., NFS may silently cache writes on the client, FUSE may not honor `fsync` at all). Running EventfoldDB on these filesystems may result in data loss that the application cannot detect or recover from.
+
+**Other Linux filesystems.** Other local Linux filesystems — XFS, btrfs, ZFS, tmpfs — may work with EventfoldDB but are not validated. Their journaling and fsync semantics differ in subtle ways (e.g., XFS historically required explicit `O_DSYNC` or `fsync` after `rename` for atomic file replacement; btrfs uses copy-on-write rather than journaling; tmpfs provides no durability at all). Operators who choose a filesystem other than ext4 `data=ordered` should verify its fsync behavior independently.
+
 ## In-Memory Model
 
 On startup, the server reads the entire log file from beginning to end, deserializing each record and building an in-memory index. This index has two structures:

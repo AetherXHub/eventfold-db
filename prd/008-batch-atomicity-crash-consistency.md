@@ -1,6 +1,6 @@
 # PRD 008: Batch Atomicity and Crash Consistency Hardening
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-25
 **Author:** PRD Writer Agent
 

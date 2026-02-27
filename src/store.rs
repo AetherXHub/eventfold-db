@@ -21,22 +21,55 @@ use crate::types::{
 /// Size of the file header in bytes (magic + format version).
 const HEADER_SIZE: usize = 8;
 
-/// Check whether any valid record exists in `data` after byte offset `start`.
+/// Check whether a valid batch header exists in `data` after byte offset `start`.
 ///
 /// Scans forward one byte at a time from `start + 1` through the end of the
-/// buffer, attempting to decode a record at each offset. Returns `true` if a
-/// valid `DecodeOutcome::Complete` is found, indicating mid-file corruption
+/// buffer, looking for the `BATCH_HEADER_MAGIC` bytes followed by a decodable
+/// batch header. Returns `true` if found, indicating mid-file corruption
 /// (the corrupt region is not at the tail).
-fn has_valid_record_after(data: &[u8], start: usize) -> bool {
-    // Start scanning from the byte after the corruption point. We try every
-    // possible offset because we do not know the record boundaries after
-    // corruption.
+fn has_valid_batch_after(data: &[u8], start: usize) -> bool {
     for probe in (start + 1)..data.len() {
-        if let Ok(DecodeOutcome::Complete { .. }) = codec::decode_record(&data[probe..]) {
+        if let Ok(DecodeOutcome::Complete { .. }) = codec::decode_batch_header(&data[probe..]) {
             return true;
         }
     }
     false
+}
+
+/// Truncate the log file to a given offset, fsync, and return a `Store` with
+/// the events recovered so far.
+///
+/// This is the common recovery path for all partial/corrupt batch scenarios:
+/// incomplete header, incomplete record, missing footer, or CRC mismatch.
+///
+/// # Arguments
+///
+/// * `path` - Path to the log file.
+/// * `truncate_to` - Byte offset to truncate the file to.
+/// * `events` - Events recovered from prior complete batches.
+/// * `streams` - Stream index recovered from prior complete batches.
+///
+/// # Returns
+///
+/// A `Store` with the recovered events and the file truncated.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the file cannot be opened or truncated.
+fn truncate_and_return(
+    path: &Path,
+    truncate_to: usize,
+    events: Vec<RecordedEvent>,
+    streams: HashMap<Uuid, Vec<u64>>,
+) -> Result<Store, Error> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.set_len(truncate_to as u64)?;
+    file.sync_all()?;
+
+    Ok(Store {
+        file,
+        log: Arc::new(RwLock::new(EventLog { events, streams })),
+    })
 }
 
 /// Thread-safe, read-optimized view of the event log.
@@ -113,6 +146,15 @@ impl Store {
             file.write_all(&codec::encode_header())?;
             file.sync_all()?;
 
+            // Fsync the parent directory so the new file's directory entry is
+            // durable. Without this, a crash between file creation and the OS
+            // flushing the directory entry could leave the file inaccessible.
+            let parent = path
+                .parent()
+                .expect("log path must have a parent directory");
+            let dir_handle = File::open(parent)?;
+            dir_handle.sync_all()?;
+
             return Ok(Store {
                 file,
                 log: Arc::new(RwLock::new(EventLog {
@@ -138,7 +180,8 @@ impl Store {
             .expect("slice is exactly 8 bytes");
         codec::decode_header(header)?;
 
-        // Decode records sequentially from offset HEADER_SIZE.
+        // Decode batches sequentially from offset HEADER_SIZE.
+        // Each batch is: BatchHeader (16 bytes) + N records + BatchFooter (8 bytes).
         let mut events = Vec::new();
         let mut streams: HashMap<Uuid, Vec<u64>> = HashMap::new();
         let mut offset = HEADER_SIZE;
@@ -149,45 +192,117 @@ impl Store {
                 break;
             }
 
-            match codec::decode_record(remaining) {
-                Ok(DecodeOutcome::Complete { event, consumed }) => {
-                    let global_pos = event.global_position;
-                    let stream_id = event.stream_id;
-                    events.push(event);
-                    streams.entry(stream_id).or_default().push(global_pos);
+            let batch_start_offset = offset;
+
+            // Step 1: Decode batch header.
+            let header = match codec::decode_batch_header(remaining) {
+                Ok(DecodeOutcome::Complete { value, consumed }) => {
                     offset += consumed;
+                    value
                 }
-                Ok(DecodeOutcome::Incomplete) | Err(Error::CorruptRecord { .. }) => {
-                    // Potential trailing corruption/incompleteness. Check
-                    // whether any valid records exist after this point.
-                    // If so, it is mid-file corruption (fatal).
-                    if has_valid_record_after(&data, offset) {
+                Ok(DecodeOutcome::Incomplete) => {
+                    // Trailing partial header -- truncate to batch start.
+                    tracing::warn!(
+                        batch_start_offset,
+                        valid_events = events.len(),
+                        "truncating trailing partial batch header at byte offset \
+                         {batch_start_offset}"
+                    );
+                    return truncate_and_return(path, batch_start_offset, events, streams);
+                }
+                Err(Error::CorruptRecord { .. }) => {
+                    // Bad magic at this offset. Check if valid data follows.
+                    if has_valid_batch_after(&data, batch_start_offset) {
                         return Err(Error::CorruptRecord {
                             position: events.len() as u64,
-                            detail: "mid-file corruption: valid records follow \
-                                     corrupt/incomplete record"
+                            detail: "mid-file corruption: valid batch follows \
+                                     corrupt data"
                                 .to_string(),
                         });
                     }
-
-                    // Trailing partial/corrupt record -- truncate.
+                    // Trailing corruption -- truncate.
                     tracing::warn!(
-                        offset,
+                        batch_start_offset,
                         valid_events = events.len(),
-                        "truncating trailing partial/corrupt record at byte offset {offset}"
+                        "truncating trailing corrupt data at byte offset \
+                         {batch_start_offset}"
                     );
-
-                    // Reopen file for write, truncate to last valid boundary, fsync.
-                    let file = OpenOptions::new().read(true).write(true).open(path)?;
-                    file.set_len(offset as u64)?;
-                    file.sync_all()?;
-
-                    return Ok(Store {
-                        file,
-                        log: Arc::new(RwLock::new(EventLog { events, streams })),
-                    });
+                    return truncate_and_return(path, batch_start_offset, events, streams);
                 }
                 Err(e) => return Err(e),
+            };
+
+            // Step 2: Decode record_count records.
+            let mut batch_events = Vec::with_capacity(header.record_count as usize);
+            for _ in 0..header.record_count {
+                match codec::decode_record(&data[offset..]) {
+                    Ok(DecodeOutcome::Complete { value, consumed }) => {
+                        offset += consumed;
+                        batch_events.push(value);
+                    }
+                    Ok(DecodeOutcome::Incomplete) | Err(Error::CorruptRecord { .. }) => {
+                        // Incomplete or corrupt record within batch -- truncate
+                        // the entire batch.
+                        tracing::warn!(
+                            batch_start_offset,
+                            valid_events = events.len(),
+                            "truncating partial batch (incomplete/corrupt record) \
+                             at byte offset {batch_start_offset}"
+                        );
+                        return truncate_and_return(path, batch_start_offset, events, streams);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Step 3: Decode batch footer.
+            let footer = match codec::decode_batch_footer(&data[offset..]) {
+                Ok(DecodeOutcome::Complete { value, consumed }) => {
+                    offset += consumed;
+                    value
+                }
+                Ok(DecodeOutcome::Incomplete) => {
+                    // Missing/incomplete footer -- truncate the entire batch.
+                    tracing::warn!(
+                        batch_start_offset,
+                        valid_events = events.len(),
+                        "truncating partial batch (incomplete footer) at byte \
+                         offset {batch_start_offset}"
+                    );
+                    return truncate_and_return(path, batch_start_offset, events, streams);
+                }
+                Err(Error::CorruptRecord { .. }) => {
+                    // Wrong footer magic -- truncate the entire batch.
+                    tracing::warn!(
+                        batch_start_offset,
+                        valid_events = events.len(),
+                        "truncating partial batch (corrupt footer magic) at byte \
+                         offset {batch_start_offset}"
+                    );
+                    return truncate_and_return(path, batch_start_offset, events, streams);
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Step 4: Verify batch CRC over header + record bytes.
+            let header_plus_records = &data[batch_start_offset..offset - codec::BATCH_FOOTER_SIZE];
+            let computed_crc = crc32fast::hash(header_plus_records);
+            if footer.batch_crc != computed_crc {
+                tracing::warn!(
+                    batch_start_offset,
+                    valid_events = events.len(),
+                    "truncating batch with CRC mismatch at byte offset \
+                     {batch_start_offset}"
+                );
+                return truncate_and_return(path, batch_start_offset, events, streams);
+            }
+
+            // Step 5: Batch is valid -- commit events to the in-memory index.
+            for event in batch_events {
+                let global_pos = event.global_position;
+                let stream_id = event.stream_id;
+                streams.entry(stream_id).or_default().push(global_pos);
+                events.push(event);
             }
         }
 
@@ -373,8 +488,10 @@ impl Store {
         };
 
         // Step 2: Build RecordedEvents and validate each one (no lock held).
+        // The first_global_pos is captured before the loop increments next_global.
+        let first_global_pos = next_global;
         let mut recorded = Vec::with_capacity(proposed_events.len());
-        let mut encoded_batch = Vec::new();
+        let mut encoded_records = Vec::new();
 
         for proposed in &proposed_events {
             // Validate event type: must be non-empty.
@@ -411,19 +528,39 @@ impl Store {
                 });
             }
 
-            encoded_batch.extend_from_slice(&encoded);
+            encoded_records.extend_from_slice(&encoded);
             recorded.push(event);
             next_global += 1;
             next_stream_version += 1;
         }
 
-        // Step 3: Write all encoded records to disk and fsync (no lock held).
+        // Step 3: Wrap records in a batch envelope (header + records + footer).
+        let batch_header = codec::encode_batch_header(recorded.len() as u32, first_global_pos);
+
+        // CRC32 covers the header bytes concatenated with all record bytes.
+        let batch_crc = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&batch_header);
+            hasher.update(&encoded_records);
+            hasher.finalize()
+        };
+        let batch_footer = codec::encode_batch_footer(batch_crc);
+
+        // Build the contiguous buffer: header || records || footer.
+        let mut encoded_batch = Vec::with_capacity(
+            codec::BATCH_HEADER_SIZE + encoded_records.len() + codec::BATCH_FOOTER_SIZE,
+        );
+        encoded_batch.extend_from_slice(&batch_header);
+        encoded_batch.extend_from_slice(&encoded_records);
+        encoded_batch.extend_from_slice(&batch_footer);
+
+        // Step 4: Write the entire batch envelope to disk and fsync (no lock held).
         use std::io::Seek;
         self.file.seek(std::io::SeekFrom::End(0))?;
         self.file.write_all(&encoded_batch)?;
         self.file.sync_all()?;
 
-        // Step 4: Acquire write lock to update in-memory index (after fsync).
+        // Step 5: Acquire write lock to update in-memory index (after fsync).
         {
             let mut log = self.log.write().expect("EventLog RwLock poisoned");
             let stream_entry = log.streams.entry(stream_id).or_default();
@@ -475,15 +612,15 @@ mod tests {
         }
     }
 
-    /// Helper: write a seeded log file with the given events (header + encoded records).
+    /// Helper: write a seeded log file with the given events wrapped in a
+    /// single batch envelope (header + batch_header + records + batch_footer).
     fn seed_file(path: &std::path::Path, events: &[RecordedEvent]) {
         use std::io::Write;
         let mut file = File::create(path).expect("create seed file");
         file.write_all(&codec::encode_header())
             .expect("write header");
-        for event in events {
-            file.write_all(&codec::encode_record(event))
-                .expect("write record");
+        if !events.is_empty() {
+            file.write_all(&encode_batch(events)).expect("write batch");
         }
         file.sync_all().expect("sync seed file");
     }
@@ -639,81 +776,78 @@ mod tests {
         );
     }
 
-    // -- AC-4: Seed 3 events, flip last byte of 3rd record's payload (CRC fails),
-    // reopen -- only 2 events recovered, corrupt 3rd treated as trailing.
+    // -- AC-4: Two batches; corrupt a record in the second batch. With batch
+    // recovery, the entire second batch is discarded. Only the first batch's
+    // events are recovered.
     #[test]
-    fn recovery_truncates_crc_corrupt_last_record() {
+    fn recovery_truncates_corrupt_record_in_last_batch() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("events.log");
 
         let stream = Uuid::new_v4();
-        let events = vec![
+
+        // Batch 1: 2 events.
+        let batch1 = vec![
             make_event(0, stream, 0, "Evt", b"payload0"),
             make_event(1, stream, 1, "Evt", b"payload1"),
-            make_event(2, stream, 2, "Evt", b"payload2"),
         ];
+        // Batch 2: 1 event.
+        let batch2 = vec![make_event(2, stream, 2, "Evt", b"payload2")];
 
-        seed_file(&path, &events);
+        seed_batch_file(&path, &[&batch1, &batch2]);
 
-        // Compute the byte offset where the 3rd record starts:
-        // header (8) + record_0 size + record_1 size.
-        let rec0 = codec::encode_record(&events[0]);
-        let rec1 = codec::encode_record(&events[1]);
-        let valid_boundary = HEADER_SIZE + rec0.len() + rec1.len();
+        // Compute the byte offset of the second batch's start.
+        let batch1_bytes = encode_batch(&batch1);
+        let valid_boundary = HEADER_SIZE + batch1_bytes.len();
 
-        // Read the file, flip the last byte of the 3rd record's payload region
-        // (which is just before the CRC at the end).
+        // Read the file, flip a byte in the second batch's record body
+        // (inside the payload, before the per-record CRC).
         let mut data = std::fs::read(&path).expect("read file");
-        // The last 4 bytes of the file are the CRC of the 3rd record.
-        // The byte just before the CRC is the last payload byte.
-        let corrupt_idx = data.len() - 5;
+        // The last 4 bytes of the file are batch_footer CRC. Before that is the
+        // per-record CRC (4 bytes) at the end of the record. Flip a byte in the
+        // record's payload region: 13 bytes before the file end is well within
+        // the record body.
+        let corrupt_idx = data.len() - 13;
         data[corrupt_idx] ^= 0xFF;
         std::fs::write(&path, &data).expect("write corrupted file");
 
-        // Reopen -- should recover only the first 2 events.
+        // Reopen -- should recover only the first 2 events (batch 1).
         let store = Store::open(&path).expect("recovery should succeed");
 
         assert_eq!(store.global_position(), 2);
         assert_eq!(store.stream_version(&stream), Some(1));
 
-        // File should be truncated to the boundary before the 3rd record.
+        // File should be truncated to the boundary before the 2nd batch.
         let final_size = std::fs::metadata(&path).expect("metadata").len() as usize;
         assert_eq!(
             final_size, valid_boundary,
-            "file should be truncated to end of 2nd record"
+            "file should be truncated to end of batch 1"
         );
     }
 
-    // -- AC-5: Seed 3 events, corrupt a byte in the 2nd record (not last),
-    // reopen -- returns Err(Error::CorruptRecord) because valid data follows.
+    // -- AC-5: Corrupt the batch header of the first batch (so it's
+    // unrecognized), but a valid second batch follows. This is mid-file
+    // corruption because valid data follows the corrupt region.
     #[test]
     fn recovery_returns_error_on_mid_file_corruption() {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let path = dir.path().join("events.log");
 
         let stream = Uuid::new_v4();
-        let events = vec![
-            make_event(0, stream, 0, "Evt", b"payload0"),
-            make_event(1, stream, 1, "Evt", b"payload1"),
-            make_event(2, stream, 2, "Evt", b"payload2"),
-        ];
 
-        seed_file(&path, &events);
+        // Batch 1: 1 event.
+        let batch1 = vec![make_event(0, stream, 0, "Evt", b"payload0")];
+        // Batch 2: 1 event.
+        let batch2 = vec![make_event(1, stream, 1, "Evt", b"payload1")];
 
-        // Corrupt a byte in the 2nd record. The 2nd record starts at:
-        // header (8) + record_0 size.
-        let rec0 = codec::encode_record(&events[0]);
-        let rec1_start = HEADER_SIZE + rec0.len();
+        seed_batch_file(&path, &[&batch1, &batch2]);
 
-        // Flip a byte within the 2nd record's payload region. The payload
-        // starts after fixed fields inside the record. We flip a byte
-        // roughly in the middle of the 2nd record body.
+        // Corrupt the batch header magic of batch 1 (at offset HEADER_SIZE).
         let mut data = std::fs::read(&path).expect("read file");
-        let corrupt_idx = rec1_start + 20; // well inside the 2nd record body
-        data[corrupt_idx] ^= 0xFF;
+        data[HEADER_SIZE] ^= 0xFF; // corrupt first byte of batch 1 header magic
         std::fs::write(&path, &data).expect("write corrupted file");
 
-        // Reopen -- should return CorruptRecord because the 3rd record is valid.
+        // Reopen -- should return CorruptRecord because a valid batch 2 follows.
         match Store::open(&path) {
             Err(Error::CorruptRecord { .. }) => {} // expected
             Err(other) => panic!("expected CorruptRecord, got: {other:?}"),
@@ -1548,6 +1682,534 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidHeader, got: {other:?}"),
             Ok(_) => panic!("expected InvalidHeader, but open() succeeded"),
+        }
+    }
+
+    // -- PRD 008 Ticket 2: Batch envelope tests --
+
+    // AC-1: Append 3 events to a fresh store. Read raw bytes.
+    // After the 8-byte file header: bytes 0..16 decode as a valid BatchHeader
+    // with record_count==3 and first_global_pos==0. Next bytes are 3
+    // individually-decodable records. Next 8 bytes decode as a valid
+    // BatchFooter with the correct CRC32. No extra bytes remain.
+    #[test]
+    fn batch_envelope_raw_bytes_three_events() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+        let proposed = vec![
+            make_proposed("Evt0", b"p0"),
+            make_proposed("Evt1", b"p1"),
+            make_proposed("Evt2", b"p2"),
+        ];
+
+        store
+            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .expect("append should succeed");
+
+        // Read raw file bytes (do NOT drop and reopen the store).
+        let data = std::fs::read(&path).expect("read file");
+
+        // Skip the 8-byte file header.
+        let batch_data = &data[HEADER_SIZE..];
+
+        // First 16 bytes: batch header.
+        let header_result = codec::decode_batch_header(&batch_data[..codec::BATCH_HEADER_SIZE])
+            .expect("decode batch header should not error");
+        let (header, header_consumed) = match header_result {
+            DecodeOutcome::Complete { value, consumed } => (value, consumed),
+            DecodeOutcome::Incomplete => panic!("batch header should be complete"),
+        };
+        assert_eq!(header.record_count, 3);
+        assert_eq!(header.first_global_pos, 0);
+        assert_eq!(header_consumed, codec::BATCH_HEADER_SIZE);
+
+        // Next: 3 individually-decodable records.
+        let mut offset = codec::BATCH_HEADER_SIZE;
+        for i in 0u64..3 {
+            let record_result = codec::decode_record(&batch_data[offset..])
+                .unwrap_or_else(|e| panic!("decode record {i} should succeed: {e}"));
+            match record_result {
+                DecodeOutcome::Complete { value, consumed } => {
+                    assert_eq!(value.global_position, i, "record {i} global_position");
+                    offset += consumed;
+                }
+                DecodeOutcome::Incomplete => panic!("record {i} should be complete"),
+            }
+        }
+
+        // Next 8 bytes: batch footer.
+        let footer_result = codec::decode_batch_footer(&batch_data[offset..])
+            .expect("decode batch footer should not error");
+        let (footer, footer_consumed) = match footer_result {
+            DecodeOutcome::Complete { value, consumed } => (value, consumed),
+            DecodeOutcome::Incomplete => panic!("batch footer should be complete"),
+        };
+        assert_eq!(footer_consumed, codec::BATCH_FOOTER_SIZE);
+
+        // Verify CRC32: recompute over header bytes + record bytes.
+        let header_plus_records = &batch_data[..offset];
+        let expected_crc = crc32fast::hash(header_plus_records);
+        assert_eq!(
+            footer.batch_crc, expected_crc,
+            "batch footer CRC should match recomputed value"
+        );
+
+        // No extra bytes remain after the footer.
+        let total_consumed = offset + footer_consumed;
+        assert_eq!(
+            total_consumed,
+            batch_data.len(),
+            "no extra bytes should remain after batch footer"
+        );
+    }
+
+    // AC-2: Append two separate batches (2 events, then 1 event). Read raw
+    // file bytes. Verify two consecutive batch envelopes: first has
+    // record_count==2, second has record_count==1 and first_global_pos==2.
+    #[test]
+    fn batch_envelope_two_consecutive_batches() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+
+        // First batch: 2 events.
+        let batch1 = vec![make_proposed("Evt0", b"p0"), make_proposed("Evt1", b"p1")];
+        store
+            .append(stream_id, ExpectedVersion::NoStream, batch1)
+            .expect("first append should succeed");
+
+        // Second batch: 1 event.
+        let batch2 = vec![make_proposed("Evt2", b"p2")];
+        store
+            .append(stream_id, ExpectedVersion::Exact(1), batch2)
+            .expect("second append should succeed");
+
+        let data = std::fs::read(&path).expect("read file");
+        let batch_data = &data[HEADER_SIZE..];
+
+        // --- First batch envelope ---
+        let h1 = match codec::decode_batch_header(batch_data).expect("decode batch header 1") {
+            DecodeOutcome::Complete { value, .. } => value,
+            DecodeOutcome::Incomplete => panic!("batch header 1 should be complete"),
+        };
+        assert_eq!(h1.record_count, 2);
+        assert_eq!(h1.first_global_pos, 0);
+
+        // Decode 2 records.
+        let mut offset = codec::BATCH_HEADER_SIZE;
+        for i in 0u64..2 {
+            match codec::decode_record(&batch_data[offset..])
+                .unwrap_or_else(|e| panic!("decode record {i}: {e}"))
+            {
+                DecodeOutcome::Complete { consumed, .. } => offset += consumed,
+                DecodeOutcome::Incomplete => panic!("record {i} should be complete"),
+            }
+        }
+
+        // Decode footer 1 and verify CRC.
+        let f1 = match codec::decode_batch_footer(&batch_data[offset..])
+            .expect("decode batch footer 1")
+        {
+            DecodeOutcome::Complete { value, .. } => value,
+            DecodeOutcome::Incomplete => panic!("batch footer 1 should be complete"),
+        };
+        let expected_crc1 = crc32fast::hash(&batch_data[..offset]);
+        assert_eq!(f1.batch_crc, expected_crc1, "batch 1 CRC mismatch");
+        offset += codec::BATCH_FOOTER_SIZE;
+
+        // --- Second batch envelope ---
+        let batch2_start = offset;
+        let h2 = match codec::decode_batch_header(&batch_data[offset..])
+            .expect("decode batch header 2")
+        {
+            DecodeOutcome::Complete { value, .. } => value,
+            DecodeOutcome::Incomplete => panic!("batch header 2 should be complete"),
+        };
+        assert_eq!(h2.record_count, 1);
+        assert_eq!(h2.first_global_pos, 2);
+
+        offset += codec::BATCH_HEADER_SIZE;
+
+        // Decode 1 record.
+        match codec::decode_record(&batch_data[offset..]).expect("decode record 2") {
+            DecodeOutcome::Complete { consumed, .. } => offset += consumed,
+            DecodeOutcome::Incomplete => panic!("record 2 should be complete"),
+        }
+
+        // Decode footer 2 and verify CRC.
+        let f2 = match codec::decode_batch_footer(&batch_data[offset..])
+            .expect("decode batch footer 2")
+        {
+            DecodeOutcome::Complete { value, .. } => value,
+            DecodeOutcome::Incomplete => panic!("batch footer 2 should be complete"),
+        };
+        let expected_crc2 = crc32fast::hash(&batch_data[batch2_start..offset]);
+        assert_eq!(f2.batch_crc, expected_crc2, "batch 2 CRC mismatch");
+        offset += codec::BATCH_FOOTER_SIZE;
+
+        // No extra bytes.
+        assert_eq!(
+            offset,
+            batch_data.len(),
+            "no extra bytes after second batch"
+        );
+    }
+
+    // AC-3: Store::append still returns the correct Vec<RecordedEvent> with
+    // correct global_position and stream_version values after the batch
+    // envelope change.
+    #[test]
+    fn batch_envelope_append_returns_correct_recorded_events() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+
+        // First batch: 2 events to a new stream.
+        let batch1 = vec![
+            make_proposed("OrderPlaced", b"{\"qty\":1}"),
+            make_proposed("OrderConfirmed", b"{\"status\":\"ok\"}"),
+        ];
+        let recorded1 = store
+            .append(stream_id, ExpectedVersion::NoStream, batch1)
+            .expect("first append should succeed");
+
+        assert_eq!(recorded1.len(), 2);
+        assert_eq!(recorded1[0].global_position, 0);
+        assert_eq!(recorded1[0].stream_version, 0);
+        assert_eq!(recorded1[0].stream_id, stream_id);
+        assert_eq!(recorded1[0].event_type, "OrderPlaced");
+        assert_eq!(recorded1[1].global_position, 1);
+        assert_eq!(recorded1[1].stream_version, 1);
+        assert_eq!(recorded1[1].stream_id, stream_id);
+        assert_eq!(recorded1[1].event_type, "OrderConfirmed");
+
+        // Second batch: 1 event to the same stream.
+        let batch2 = vec![make_proposed("OrderShipped", b"{\"carrier\":\"ups\"}")];
+        let recorded2 = store
+            .append(stream_id, ExpectedVersion::Exact(1), batch2)
+            .expect("second append should succeed");
+
+        assert_eq!(recorded2.len(), 1);
+        assert_eq!(recorded2[0].global_position, 2);
+        assert_eq!(recorded2[0].stream_version, 2);
+        assert_eq!(recorded2[0].stream_id, stream_id);
+        assert_eq!(recorded2[0].event_type, "OrderShipped");
+
+        // Verify store-level state.
+        assert_eq!(store.global_position(), 3);
+        assert_eq!(store.stream_version(&stream_id), Some(2));
+    }
+
+    // -- PRD 008 Ticket 3: Batch-aware recovery tests --
+
+    /// Helper: write a complete batch (header + records + footer) to a buffer.
+    ///
+    /// Returns the encoded bytes for one batch envelope containing the given
+    /// events. The CRC covers the header + all record bytes.
+    fn encode_batch(events: &[RecordedEvent]) -> Vec<u8> {
+        let header_bytes =
+            codec::encode_batch_header(events.len() as u32, events[0].global_position);
+        let mut record_bytes = Vec::new();
+        for event in events {
+            record_bytes.extend_from_slice(&codec::encode_record(event));
+        }
+        let batch_crc = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&header_bytes);
+            hasher.update(&record_bytes);
+            hasher.finalize()
+        };
+        let footer_bytes = codec::encode_batch_footer(batch_crc);
+
+        let mut buf = Vec::with_capacity(
+            codec::BATCH_HEADER_SIZE + record_bytes.len() + codec::BATCH_FOOTER_SIZE,
+        );
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&record_bytes);
+        buf.extend_from_slice(&footer_bytes);
+        buf
+    }
+
+    /// Helper: write a log file with the file header followed by the given
+    /// batch-formatted event groups.
+    fn seed_batch_file(path: &std::path::Path, batches: &[&[RecordedEvent]]) {
+        use std::io::Write;
+        let mut file = File::create(path).expect("create seed file");
+        file.write_all(&codec::encode_header())
+            .expect("write header");
+        for batch in batches {
+            file.write_all(&encode_batch(batch)).expect("write batch");
+        }
+        file.sync_all().expect("sync seed file");
+    }
+
+    // AC-6: Store::open on a non-existent path returns 0 events. A second
+    // Store::open on the same path also returns 0 events (validating the
+    // directory fsync ensures the file is findable after simulated restart).
+    #[test]
+    fn open_new_file_dir_fsync_and_reopen() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        assert!(!path.exists());
+
+        // First open: creates the file.
+        let store = Store::open(&path).expect("first open should succeed");
+        assert_eq!(store.global_position(), 0);
+        assert!(store.read_all(0, 100).is_empty());
+        drop(store);
+
+        // Second open: should find the file (dir entry was fsynced).
+        let store2 = Store::open(&path).expect("second open should succeed");
+        assert_eq!(store2.global_position(), 0);
+        assert!(store2.read_all(0, 100).is_empty());
+    }
+
+    // AC-2: Write a complete batch (header + 2 records + footer), then
+    // remove the last 8 bytes (footer). Store::open should return 0 events
+    // and truncate the file to HEADER_SIZE (the start of the incomplete batch).
+    #[test]
+    fn recovery_truncates_batch_missing_footer() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let stream = Uuid::new_v4();
+        let events = vec![
+            make_event(0, stream, 0, "Evt", b"p0"),
+            make_event(1, stream, 1, "Evt", b"p1"),
+        ];
+
+        // Write file header + complete batch.
+        seed_batch_file(&path, &[&events]);
+
+        // Remove the last 8 bytes (the footer).
+        let original_size = std::fs::metadata(&path).expect("metadata").len();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for truncation");
+        file.set_len(original_size - codec::BATCH_FOOTER_SIZE as u64)
+            .expect("truncate footer");
+        file.sync_all().expect("sync");
+
+        let store = Store::open(&path).expect("recovery should succeed");
+
+        // No events recovered (the only batch was incomplete).
+        assert_eq!(store.global_position(), 0);
+        assert!(store.read_all(0, 100).is_empty());
+
+        // File should be truncated to just the file header.
+        let final_size = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(
+            final_size, HEADER_SIZE as u64,
+            "file should be truncated to file header (batch start offset)"
+        );
+    }
+
+    // AC-3: Write a batch header + 2 records, then truncate after the first
+    // record's first 4 bytes (mid-record). No footer. Store::open should
+    // return 0 events and truncate the file to HEADER_SIZE.
+    #[test]
+    fn recovery_truncates_batch_mid_record_truncation() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let stream = Uuid::new_v4();
+        let events = [
+            make_event(0, stream, 0, "Evt", b"p0"),
+            make_event(1, stream, 1, "Evt", b"p1"),
+        ];
+
+        // Manually construct: file header + batch header + first record
+        // + first 4 bytes of second record.
+        use std::io::Write;
+        let mut file = File::create(&path).expect("create file");
+        file.write_all(&codec::encode_header())
+            .expect("write file header");
+
+        let batch_header = codec::encode_batch_header(2, 0);
+        file.write_all(&batch_header).expect("write batch header");
+
+        let rec0 = codec::encode_record(&events[0]);
+        file.write_all(&rec0).expect("write record 0");
+
+        let rec1 = codec::encode_record(&events[1]);
+        // Write only the first 4 bytes of record 1 (mid-record truncation).
+        file.write_all(&rec1[..4]).expect("write partial record 1");
+        file.sync_all().expect("sync");
+
+        let store = Store::open(&path).expect("recovery should succeed");
+
+        assert_eq!(store.global_position(), 0);
+        assert!(store.read_all(0, 100).is_empty());
+
+        let final_size = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(
+            final_size, HEADER_SIZE as u64,
+            "file should be truncated to file header (batch start offset)"
+        );
+    }
+
+    // AC-4: Two complete batches followed by an incomplete third batch
+    // (header + 1 of 2 records, no footer). Store::open should recover
+    // exactly the events from the first two batches.
+    #[test]
+    fn recovery_two_complete_batches_plus_partial_third() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let stream = Uuid::new_v4();
+
+        // Batch 1: 2 events (global positions 0, 1).
+        let batch1_events = vec![
+            make_event(0, stream, 0, "Evt", b"p0"),
+            make_event(1, stream, 1, "Evt", b"p1"),
+        ];
+        // Batch 2: 1 event (global position 2).
+        let batch2_events = vec![make_event(2, stream, 2, "Evt", b"p2")];
+        // Batch 3 (incomplete): header says 2 records, but only 1 written, no footer.
+        let batch3_event = make_event(3, stream, 3, "Evt", b"p3");
+
+        use std::io::Write;
+        let mut file = File::create(&path).expect("create file");
+        file.write_all(&codec::encode_header())
+            .expect("write file header");
+
+        // Write two complete batches.
+        file.write_all(&encode_batch(&batch1_events))
+            .expect("write batch 1");
+        file.write_all(&encode_batch(&batch2_events))
+            .expect("write batch 2");
+
+        // Write incomplete third batch: header (says 2 records) + 1 record, no footer.
+        let batch3_header = codec::encode_batch_header(2, 3);
+        file.write_all(&batch3_header)
+            .expect("write batch 3 header");
+        file.write_all(&codec::encode_record(&batch3_event))
+            .expect("write batch 3 record 0");
+        // Omit second record and footer.
+        file.sync_all().expect("sync");
+
+        let store = Store::open(&path).expect("recovery should succeed");
+
+        // Should recover exactly 3 events from the first two batches.
+        assert_eq!(store.global_position(), 3);
+
+        let all = store.read_all(0, 100);
+        assert_eq!(all.len(), 3);
+        for (i, event) in all.iter().enumerate() {
+            assert_eq!(event.global_position, i as u64);
+        }
+    }
+
+    // AC-7: Write two complete batches manually. Store::open recovers all
+    // events in global-position order with no gaps.
+    #[test]
+    fn recovery_two_complete_batches_all_events_correct() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let stream_a = Uuid::new_v4();
+        let stream_b = Uuid::new_v4();
+
+        // Batch 1: 2 events on stream_a.
+        let batch1 = vec![
+            make_event(0, stream_a, 0, "A0", b"a0"),
+            make_event(1, stream_a, 1, "A1", b"a1"),
+        ];
+        // Batch 2: 2 events on stream_b.
+        let batch2 = vec![
+            make_event(2, stream_b, 0, "B0", b"b0"),
+            make_event(3, stream_b, 1, "B1", b"b1"),
+        ];
+
+        seed_batch_file(&path, &[&batch1, &batch2]);
+
+        let store = Store::open(&path).expect("recovery should succeed");
+
+        assert_eq!(store.global_position(), 4);
+
+        let all = store.read_all(0, 100);
+        assert_eq!(all.len(), 4);
+        for (i, event) in all.iter().enumerate() {
+            assert_eq!(
+                event.global_position, i as u64,
+                "global_position at index {i}"
+            );
+        }
+        // Verify event types to ensure correct ordering.
+        assert_eq!(all[0].event_type, "A0");
+        assert_eq!(all[1].event_type, "A1");
+        assert_eq!(all[2].event_type, "B0");
+        assert_eq!(all[3].event_type, "B1");
+
+        // Verify stream index integrity.
+        assert_eq!(store.stream_version(&stream_a), Some(1));
+        assert_eq!(store.stream_version(&stream_b), Some(1));
+    }
+
+    // AC-5: File with FORMAT_VERSION=1 header -> Err(InvalidHeader) mentioning "version".
+    #[test]
+    fn recovery_rejects_version_1_file() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        // Write old FORMAT_VERSION=1 file header: magic EFDB + version 1 LE.
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&[0x45, 0x46, 0x44, 0x42]); // EFDB
+        header[4..8].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        std::fs::write(&path, header).expect("write file");
+
+        match Store::open(&path) {
+            Err(Error::InvalidHeader(msg)) => {
+                assert!(
+                    msg.contains("version"),
+                    "error should mention 'version', got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidHeader, got: {other:?}"),
+            Ok(_) => panic!("expected InvalidHeader, but open() succeeded"),
+        }
+    }
+
+    // AC-4: store.read_all(0, 100) after a 3-event append returns all 3
+    // events in order.
+    #[test]
+    fn batch_envelope_read_all_after_three_event_append() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+        let proposed = vec![
+            make_proposed("Evt0", b"p0"),
+            make_proposed("Evt1", b"p1"),
+            make_proposed("Evt2", b"p2"),
+        ];
+
+        store
+            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .expect("append should succeed");
+
+        let events = store.read_all(0, 100);
+        assert_eq!(events.len(), 3);
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(
+                event.global_position, i as u64,
+                "global_position for event {i}"
+            );
+            assert_eq!(
+                event.stream_version, i as u64,
+                "stream_version for event {i}"
+            );
+            assert_eq!(event.stream_id, stream_id);
         }
     }
 }

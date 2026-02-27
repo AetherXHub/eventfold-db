@@ -18,39 +18,73 @@ use crate::types::RecordedEvent;
 const MAGIC: [u8; 4] = [0x45, 0x46, 0x44, 0x42];
 
 /// Current on-disk format version.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// Result of attempting to decode a single record from a byte buffer.
+/// Magic bytes identifying a batch header (ASCII "EFBB").
+pub(crate) const BATCH_HEADER_MAGIC: [u8; 4] = [0x45, 0x46, 0x42, 0x42];
+
+/// Magic bytes identifying a batch footer (ASCII "EFBF").
+pub(crate) const BATCH_FOOTER_MAGIC: [u8; 4] = [0x45, 0x46, 0x42, 0x46];
+
+/// Result of attempting to decode a value from a byte buffer.
 ///
-/// Distinguishes between a successfully decoded record and a buffer that does
-/// not contain enough bytes to form a complete record. This distinction is
-/// critical for crash recovery: a truncated trailing record is expected after
+/// Distinguishes between a successfully decoded value and a buffer that does
+/// not contain enough bytes to form a complete frame. This distinction is
+/// critical for crash recovery: a truncated trailing frame is expected after
 /// an unclean shutdown, whereas a checksum mismatch in the middle of the log
 /// indicates corruption.
 ///
+/// # Type Parameters
+///
+/// * `T` - The type of the decoded value (e.g., [`RecordedEvent`],
+///   [`BatchHeader`], [`BatchFooter`]).
+///
 /// # Variants
 ///
-/// * `Complete` - A full record was decoded successfully.
-/// * `Incomplete` - The buffer does not contain enough bytes for a complete record.
+/// * `Complete` - A full value was decoded successfully.
+/// * `Incomplete` - The buffer does not contain enough bytes for a complete frame.
 #[derive(Debug)]
-pub enum DecodeOutcome {
-    /// A full record was successfully decoded from the buffer.
+pub enum DecodeOutcome<T> {
+    /// A full value was successfully decoded from the buffer.
     Complete {
-        /// The decoded event.
-        event: RecordedEvent,
-        /// Total number of bytes consumed from the buffer (including the
-        /// 4-byte length prefix).
+        /// The decoded value.
+        value: T,
+        /// Total number of bytes consumed from the buffer.
         consumed: usize,
     },
-    /// The buffer does not contain enough bytes to form a complete record.
+    /// The buffer does not contain enough bytes to form a complete frame.
     Incomplete,
+}
+
+/// Header of a batch envelope on disk.
+///
+/// Contains the number of records in the batch and the global position of the
+/// first record. Used during recovery to validate that all records in a batch
+/// were written before the process crashed.
+#[derive(Debug, PartialEq)]
+pub struct BatchHeader {
+    /// Number of event records in this batch.
+    pub record_count: u32,
+    /// Global position of the first event record in the batch.
+    pub first_global_pos: u64,
+}
+
+/// Footer of a batch envelope on disk.
+///
+/// Contains a CRC32 checksum over the batch header bytes concatenated with all
+/// record bytes. Its presence at the expected offset signals that the batch was
+/// fully written before any crash.
+#[derive(Debug, PartialEq)]
+pub struct BatchFooter {
+    /// CRC32 checksum of batch header || record bytes.
+    pub batch_crc: u32,
 }
 
 /// Encode the file header as a fixed 8-byte array.
 ///
 /// The header consists of a 4-byte magic number (`EFDB` in ASCII) followed by
 /// a 4-byte format version in little-endian encoding. The current format
-/// version is `1`.
+/// version is `2`.
 ///
 /// # Returns
 ///
@@ -65,7 +99,7 @@ pub fn encode_header() -> [u8; 8] {
 /// Decode and validate the file header.
 ///
 /// Checks that the magic number matches `EFDB` and that the format version is
-/// supported (currently only version `1`).
+/// supported (currently only version `2`).
 ///
 /// # Arguments
 ///
@@ -169,7 +203,7 @@ pub fn encode_record(event: &RecordedEvent) -> Vec<u8> {
 ///
 /// Returns [`Error::CorruptRecord`] if the CRC32 checksum does not match or
 /// if field data is malformed (e.g., invalid UTF-8 in the event type).
-pub fn decode_record(buf: &[u8]) -> Result<DecodeOutcome, Error> {
+pub fn decode_record(buf: &[u8]) -> Result<DecodeOutcome<RecordedEvent>, Error> {
     // Need at least 4 bytes for the length prefix.
     if buf.len() < LENGTH_PREFIX_SIZE {
         return Ok(DecodeOutcome::Incomplete);
@@ -288,8 +322,126 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodeOutcome, Error> {
     };
 
     Ok(DecodeOutcome::Complete {
-        event,
+        value: event,
         consumed: total,
+    })
+}
+
+/// Size of a batch header on disk in bytes (magic 4 + count 4 + first_global_pos 8).
+pub(crate) const BATCH_HEADER_SIZE: usize = 16;
+
+/// Size of a batch footer on disk in bytes (magic 4 + crc 4).
+pub(crate) const BATCH_FOOTER_SIZE: usize = 8;
+
+/// Encode a batch header as a fixed 16-byte array.
+///
+/// The header consists of the 4-byte batch magic (`EFBB`), followed by the
+/// record count as `u32` LE and the first global position as `u64` LE.
+///
+/// # Arguments
+///
+/// * `record_count` - Number of event records in the batch.
+/// * `first_global_pos` - Global position of the first event record.
+///
+/// # Returns
+///
+/// A 16-byte array containing the encoded batch header.
+pub fn encode_batch_header(record_count: u32, first_global_pos: u64) -> [u8; 16] {
+    let mut buf = [0u8; BATCH_HEADER_SIZE];
+    buf[0..4].copy_from_slice(&BATCH_HEADER_MAGIC);
+    buf[4..8].copy_from_slice(&record_count.to_le_bytes());
+    buf[8..16].copy_from_slice(&first_global_pos.to_le_bytes());
+    buf
+}
+
+/// Decode a batch header from the start of a byte buffer.
+///
+/// Returns [`DecodeOutcome::Incomplete`] if the buffer has fewer than 16 bytes,
+/// or [`Error::CorruptRecord`] if the magic bytes do not match.
+///
+/// # Arguments
+///
+/// * `buf` - A byte slice starting at the beginning of a batch header.
+///
+/// # Returns
+///
+/// A [`DecodeOutcome<BatchHeader>`] on success.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptRecord`] if the batch header magic bytes are wrong.
+pub fn decode_batch_header(buf: &[u8]) -> Result<DecodeOutcome<BatchHeader>, Error> {
+    if buf.len() < BATCH_HEADER_SIZE {
+        return Ok(DecodeOutcome::Incomplete);
+    }
+    if buf[0..4] != BATCH_HEADER_MAGIC {
+        return Err(Error::CorruptRecord {
+            position: 0,
+            detail: "wrong batch header magic bytes".to_string(),
+        });
+    }
+    let record_count = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let first_global_pos = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    Ok(DecodeOutcome::Complete {
+        value: BatchHeader {
+            record_count,
+            first_global_pos,
+        },
+        consumed: BATCH_HEADER_SIZE,
+    })
+}
+
+/// Encode a batch footer as a fixed 8-byte array.
+///
+/// The footer consists of the 4-byte batch footer magic (`EFBF`), followed by
+/// the batch CRC32 checksum as `u32` LE.
+///
+/// # Arguments
+///
+/// * `batch_crc` - CRC32 over batch header bytes concatenated with all record bytes.
+///
+/// # Returns
+///
+/// An 8-byte array containing the encoded batch footer.
+pub fn encode_batch_footer(batch_crc: u32) -> [u8; 8] {
+    let mut buf = [0u8; BATCH_FOOTER_SIZE];
+    buf[0..4].copy_from_slice(&BATCH_FOOTER_MAGIC);
+    buf[4..8].copy_from_slice(&batch_crc.to_le_bytes());
+    buf
+}
+
+/// Decode a batch footer from the start of a byte buffer.
+///
+/// Returns [`DecodeOutcome::Incomplete`] if the buffer has fewer than 8 bytes,
+/// or [`Error::CorruptRecord`] if the magic bytes do not match.
+///
+/// # Arguments
+///
+/// * `buf` - A byte slice starting at the beginning of a batch footer.
+///
+/// # Returns
+///
+/// A [`DecodeOutcome<BatchFooter>`] on success.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptRecord`] if the batch footer magic bytes are wrong.
+pub fn decode_batch_footer(buf: &[u8]) -> Result<DecodeOutcome<BatchFooter>, Error> {
+    if buf.len() < BATCH_FOOTER_SIZE {
+        return Ok(DecodeOutcome::Incomplete);
+    }
+    if buf[0..4] != BATCH_FOOTER_MAGIC {
+        return Err(Error::CorruptRecord {
+            position: 0,
+            detail: "wrong batch footer magic bytes".to_string(),
+        });
+    }
+    let batch_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Ok(DecodeOutcome::Complete {
+        value: BatchFooter { batch_crc },
+        consumed: BATCH_FOOTER_SIZE,
     })
 }
 
@@ -309,7 +461,7 @@ mod tests {
             payload: bytes::Bytes::from_static(b"{}"),
         };
         let outcome = DecodeOutcome::Complete {
-            event,
+            value: event,
             consumed: 100,
         };
         assert!(matches!(
@@ -320,13 +472,13 @@ mod tests {
 
     #[test]
     fn decode_outcome_incomplete_is_constructible() {
-        let outcome = DecodeOutcome::Incomplete;
+        let outcome: DecodeOutcome<RecordedEvent> = DecodeOutcome::Incomplete;
         assert!(matches!(outcome, DecodeOutcome::Incomplete));
     }
 
     #[test]
     fn decode_outcome_debug_is_non_empty() {
-        let outcome = DecodeOutcome::Incomplete;
+        let outcome: DecodeOutcome<RecordedEvent> = DecodeOutcome::Incomplete;
         let debug_str = format!("{outcome:?}");
         assert!(!debug_str.is_empty());
     }
@@ -359,7 +511,7 @@ mod tests {
         let result = decode_record(&buf).expect("decode should succeed");
         match result {
             DecodeOutcome::Complete {
-                event: decoded,
+                value: decoded,
                 consumed,
             } => {
                 assert_eq!(decoded, event);
@@ -378,7 +530,7 @@ mod tests {
         let result = decode_record(&buf).expect("decode should succeed");
         match result {
             DecodeOutcome::Complete {
-                event: decoded,
+                value: decoded,
                 consumed,
             } => {
                 assert_eq!(decoded, event);
@@ -398,7 +550,7 @@ mod tests {
         let result = decode_record(&buf).expect("decode should succeed");
         match result {
             DecodeOutcome::Complete {
-                event: decoded,
+                value: decoded,
                 consumed,
             } => {
                 assert_eq!(decoded, event);
@@ -418,7 +570,7 @@ mod tests {
         let result = decode_record(&buf).expect("decode should succeed");
         match result {
             DecodeOutcome::Complete {
-                event: decoded,
+                value: decoded,
                 consumed,
             } => {
                 assert_eq!(decoded, event);
@@ -559,7 +711,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("decode {i} should succeed: {e}"));
             match result {
                 DecodeOutcome::Complete {
-                    event: decoded,
+                    value: decoded,
                     consumed,
                 } => {
                     assert_eq!(&decoded, expected, "event {i} fields mismatch");
@@ -654,18 +806,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_header_bytes_4_to_8_are_version_1_le() {
+    fn encode_header_bytes_4_to_8_are_version_2_le() {
         let header = encode_header();
-        assert_eq!(&header[4..8], &1u32.to_le_bytes());
+        assert_eq!(&header[4..8], &2u32.to_le_bytes());
     }
 
     // AC-2: Header decoding
 
     #[test]
-    fn decode_header_round_trip_returns_version_1() {
+    fn decode_header_round_trip_returns_version_2() {
         let header = encode_header();
         let version = decode_header(&header).expect("valid header should decode");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -699,5 +851,102 @@ mod tests {
             }
             other => panic!("expected InvalidHeader, got: {other:?}"),
         }
+    }
+
+    // -- Batch header / footer tests (PRD 008, Ticket 1) --
+
+    #[test]
+    fn encode_batch_header_raw_bytes() {
+        let bytes = encode_batch_header(3, 42);
+        assert_eq!(&bytes[0..4], &[0x45, 0x46, 0x42, 0x42]);
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes());
+        assert_eq!(&bytes[8..16], &42u64.to_le_bytes());
+    }
+
+    #[test]
+    fn encode_batch_footer_raw_bytes() {
+        let bytes = encode_batch_footer(0xDEAD_BEEF);
+        assert_eq!(&bytes[0..4], &[0x45, 0x46, 0x42, 0x46]);
+        assert_eq!(&bytes[4..8], &0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_batch_header_incomplete_short_buffer() {
+        let result = decode_batch_header(&[0u8; 15]).expect("should not error");
+        assert!(matches!(result, DecodeOutcome::Incomplete));
+    }
+
+    #[test]
+    fn decode_batch_header_wrong_magic_returns_corrupt() {
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let result = decode_batch_header(&buf);
+        assert!(matches!(result, Err(Error::CorruptRecord { .. })));
+    }
+
+    #[test]
+    fn decode_batch_header_round_trip() {
+        let encoded = encode_batch_header(5, 100);
+        let result = decode_batch_header(&encoded).expect("should succeed");
+        match result {
+            DecodeOutcome::Complete { value, consumed } => {
+                assert_eq!(value.record_count, 5);
+                assert_eq!(value.first_global_pos, 100);
+                assert_eq!(consumed, 16);
+            }
+            DecodeOutcome::Incomplete => panic!("expected Complete, got Incomplete"),
+        }
+    }
+
+    #[test]
+    fn decode_batch_footer_incomplete_short_buffer() {
+        let result = decode_batch_footer(&[0u8; 7]).expect("should not error");
+        assert!(matches!(result, DecodeOutcome::Incomplete));
+    }
+
+    #[test]
+    fn decode_batch_footer_wrong_magic_returns_corrupt() {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let result = decode_batch_footer(&buf);
+        assert!(matches!(result, Err(Error::CorruptRecord { .. })));
+    }
+
+    #[test]
+    fn decode_batch_footer_round_trip() {
+        let encoded = encode_batch_footer(0x1234_5678);
+        let result = decode_batch_footer(&encoded).expect("should succeed");
+        match result {
+            DecodeOutcome::Complete { value, consumed } => {
+                assert_eq!(value.batch_crc, 0x1234_5678);
+                assert_eq!(consumed, 8);
+            }
+            DecodeOutcome::Incomplete => panic!("expected Complete, got Incomplete"),
+        }
+    }
+
+    #[test]
+    fn decode_header_rejects_version_1() {
+        // Build a valid version-1 header: correct magic + version 1
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&[0x45, 0x46, 0x44, 0x42]);
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let err = decode_header(&buf).expect_err("version 1 should be rejected");
+        match err {
+            Error::InvalidHeader(msg) => {
+                assert!(
+                    msg.contains("version"),
+                    "error message should mention 'version', got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidHeader, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_header_accepts_version_2() {
+        let header = encode_header();
+        let version = decode_header(&header).expect("version 2 header should decode");
+        assert_eq!(version, 2);
     }
 }
