@@ -6,6 +6,7 @@
 //! and exercise it through a gRPC client.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use eventfold_db::proto::event_store_client::EventStoreClient;
@@ -17,6 +18,11 @@ use eventfold_db::{
 };
 
 use tonic::transport::Channel;
+
+/// Default dedup capacity for integration tests.
+fn test_dedup_cap() -> NonZeroUsize {
+    NonZeroUsize::new(128).expect("nonzero")
+}
 
 /// Handle to a running test server, used for clean shutdown and restart scenarios.
 ///
@@ -80,7 +86,8 @@ async fn start_server_at(
 ) -> (EventStoreClient<Channel>, ServerHandle) {
     let store = Store::open(data_path).expect("store open should succeed");
     let broker = Broker::new(broker_capacity);
-    let (writer_handle, read_index, writer_join) = spawn_writer(store, 64, broker.clone());
+    let (writer_handle, read_index, writer_join) =
+        spawn_writer(store, 64, broker.clone(), test_dedup_cap());
 
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
 
@@ -470,7 +477,8 @@ async fn ac7_graceful_shutdown_durability() {
     {
         let store = Store::open(&data_path).expect("store open should succeed");
         let broker = Broker::new(64);
-        let (writer_handle, _read_index, writer_join) = spawn_writer(store, 8, broker);
+        let (writer_handle, _read_index, writer_join) =
+            spawn_writer(store, 8, broker, test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         let event = ProposedEvent {

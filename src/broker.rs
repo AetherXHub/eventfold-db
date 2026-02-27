@@ -414,8 +414,12 @@ mod tests {
     async fn ac4_subscribe_all_catchup_only() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_id = Uuid::new_v4();
         for i in 0u64..5 {
@@ -455,8 +459,12 @@ mod tests {
     async fn ac5_subscribe_all_catchup_from_middle() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_id = Uuid::new_v4();
         for i in 0u64..10 {
@@ -497,8 +505,12 @@ mod tests {
     async fn ac6_subscribe_all_live_after_catchup() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_id = Uuid::new_v4();
         for i in 0u64..3 {
@@ -576,8 +588,12 @@ mod tests {
     async fn ac7_subscribe_all_no_duplicates_during_transition() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         // Start subscription on empty store.
         let stream = subscribe_all(read_index, &broker, 0).await;
@@ -644,8 +660,12 @@ mod tests {
     async fn ac8_subscribe_stream_catchup_interleaved() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_a = Uuid::new_v4();
         let stream_b = Uuid::new_v4();
@@ -699,8 +719,12 @@ mod tests {
     async fn ac9_subscribe_stream_live_filtering() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_a = Uuid::new_v4();
         let stream_b = Uuid::new_v4();
@@ -777,8 +801,12 @@ mod tests {
     async fn ac10_subscribe_stream_nonexistent_then_live() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(64);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         let stream_id = Uuid::new_v4();
 
@@ -837,8 +865,12 @@ mod tests {
     async fn ac11_subscribe_all_lag_termination() {
         let (store, _dir) = temp_store();
         let broker = Broker::new(4);
-        let (handle, read_index, join_handle) =
-            crate::writer::spawn_writer(store, 8, broker.clone());
+        let (handle, read_index, join_handle) = crate::writer::spawn_writer(
+            store,
+            8,
+            broker.clone(),
+            std::num::NonZeroUsize::new(128).expect("nonzero"),
+        );
 
         // Start subscription on empty store (catch-up is instant).
         let stream = subscribe_all(read_index, &broker, 0).await;

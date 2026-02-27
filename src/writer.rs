@@ -4,9 +4,13 @@
 //! that gRPC handlers use to submit append requests to the writer task via
 //! a bounded `tokio::mpsc` channel.
 
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+
 use uuid::Uuid;
 
 use crate::broker::Broker;
+use crate::dedup::DedupIndex;
 use crate::error::Error;
 use crate::types::{ExpectedVersion, ProposedEvent, RecordedEvent};
 
@@ -107,18 +111,53 @@ impl WriterHandle {
     }
 }
 
+/// Validate that no two events in a proposed batch share the same `event_id`.
+///
+/// Returns `Ok(())` if all event IDs are unique, or `Err(Error::InvalidArgument)`
+/// if a duplicate is found. This is a caller error (not a dedup hit) and is
+/// rejected before any write occurs.
+///
+/// # Arguments
+///
+/// * `events` - The proposed events to validate.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if two events have the same `event_id`.
+fn validate_batch_unique_ids(events: &[ProposedEvent]) -> Result<(), Error> {
+    if events.len() <= 1 {
+        return Ok(());
+    }
+    let mut seen = HashSet::with_capacity(events.len());
+    for event in events {
+        if !seen.insert(event.event_id) {
+            return Err(Error::InvalidArgument(format!(
+                "duplicate event_id {} within batch",
+                event.event_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Run the writer task loop.
 ///
 /// Receives `AppendRequest`s from the bounded mpsc channel, processes each by
 /// calling `store.append()`, and sends the result back via the request's
 /// `response_tx`. On each iteration, the first request is received via a
-/// blocking `recv()`, then additional pending requests are drained with
+/// blocking `recv()` then additional pending requests are drained with
 /// `try_recv()` for batching. The loop exits cleanly when all senders are
 /// dropped (i.e., `rx.recv()` returns `None`).
 ///
+/// Before each `store.append()`, the dedup index is checked. If the first
+/// event ID in the proposed batch is already cached, the cached
+/// `Vec<RecordedEvent>` is returned immediately without writing to disk or
+/// publishing to the broker.
+///
 /// After each successful append (store.append returns Ok), the newly recorded
-/// events are published to the broker before the response is sent to the caller.
-/// Failed appends do not publish to the broker.
+/// events are recorded in the dedup index and published to the broker before
+/// the response is sent to the caller. Failed appends do not publish to the
+/// broker.
 ///
 /// If a response receiver has been dropped before the result is sent, a
 /// `tracing::warn!` is logged and the result is discarded.
@@ -128,10 +167,12 @@ impl WriterHandle {
 /// * `store` - The storage engine that processes appends.
 /// * `rx` - Receiver half of the bounded mpsc channel carrying append requests.
 /// * `broker` - Broadcast broker for publishing newly appended events to subscribers.
+/// * `dedup` - Bounded LRU dedup index for idempotent append detection.
 pub(crate) async fn run_writer(
     mut store: crate::store::Store,
     mut rx: tokio::sync::mpsc::Receiver<AppendRequest>,
     broker: Broker,
+    dedup: &mut DedupIndex,
 ) {
     // Block on the first request; exit when channel is closed.
     while let Some(first) = rx.recv().await {
@@ -144,17 +185,41 @@ pub(crate) async fn run_writer(
         // Process each request sequentially. Each call to store.append()
         // writes to disk, fsyncs, and updates the in-memory index.
         for req in batch {
+            // Step 0: Reject batches with duplicate event IDs within the batch.
+            if let Err(e) = validate_batch_unique_ids(&req.events) {
+                if req.response_tx.send(Err(e)).is_err() {
+                    tracing::warn!(
+                        "writer: response receiver dropped for stream {}",
+                        req.stream_id
+                    );
+                }
+                continue;
+            }
+
+            // Step 1: Check the dedup index. A hit means this exact batch was
+            // already written -- return the cached result without touching disk
+            // or the broker.
+            if let Some(cached) = dedup.check(&req.events) {
+                let result = Ok(cached.as_ref().clone());
+                if req.response_tx.send(result).is_err() {
+                    tracing::warn!(
+                        "writer: response receiver dropped for stream {}",
+                        req.stream_id
+                    );
+                }
+                continue;
+            }
+
+            // Step 2: Not a dedup hit -- perform the actual append.
             let result = store.append(req.stream_id, req.expected_version, req.events);
 
-            // On success, publish the recorded events to the broker before
-            // responding to the caller. This ensures subscribers see events
-            // in the same order they were written to disk.
+            // On success, record in dedup index first, then publish to broker.
             if let Ok(ref recorded) = result {
+                dedup.record(recorded.clone());
                 broker.publish(recorded);
             }
 
-            // Send the result back to the caller. If the oneshot receiver was
-            // already dropped (caller timed out or cancelled), log a warning.
+            // Send the result back to the caller.
             if req.response_tx.send(result).is_err() {
                 tracing::warn!(
                     "writer: response receiver dropped for stream {}",
@@ -169,14 +234,16 @@ pub(crate) async fn run_writer(
 /// Spawn the writer task on the tokio runtime.
 ///
 /// Creates a bounded mpsc channel, clones the shared event log `Arc` from the
-/// store (for the `ReadIndex`), moves the store and broker into the spawned
-/// writer task, and returns a triple of `(WriterHandle, ReadIndex, JoinHandle<()>)`.
+/// store (for the `ReadIndex`), constructs and seeds a `DedupIndex`, moves
+/// the store, broker, and dedup index into the spawned writer task, and returns
+/// a triple of `(WriterHandle, ReadIndex, JoinHandle<()>)`.
 ///
 /// # Arguments
 ///
 /// * `store` - The storage engine to move into the writer task.
 /// * `channel_capacity` - Bound on the mpsc channel. Controls backpressure.
 /// * `broker` - Broadcast broker moved into the writer task for publishing events.
+/// * `dedup_capacity` - Maximum number of event IDs tracked in the dedup index.
 ///
 /// # Returns
 ///
@@ -188,6 +255,7 @@ pub fn spawn_writer(
     store: crate::store::Store,
     channel_capacity: usize,
     broker: Broker,
+    dedup_capacity: NonZeroUsize,
 ) -> (
     WriterHandle,
     crate::reader::ReadIndex,
@@ -195,18 +263,33 @@ pub fn spawn_writer(
 ) {
     // Clone the Arc BEFORE moving store into the task.
     let log_arc = store.log();
-    let read_index = crate::reader::ReadIndex::new(log_arc);
+    let read_index = crate::reader::ReadIndex::new(log_arc.clone());
+
+    // Build and seed the dedup index from the recovered log.
+    let mut dedup = DedupIndex::new(dedup_capacity);
+    {
+        let log = log_arc.read().expect("EventLog RwLock poisoned");
+        dedup.seed_from_log(&log.events);
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity);
     let writer_handle = WriterHandle::new(tx);
 
-    let join_handle = tokio::spawn(run_writer(store, rx, broker));
+    let join_handle = tokio::spawn(async move {
+        run_writer(store, rx, broker, &mut dedup).await;
+    });
 
     (writer_handle, read_index, join_handle)
 }
 
 #[cfg(test)]
 mod tests {
+    /// Default dedup capacity for tests. Large enough to avoid eviction in
+    /// standard test scenarios.
+    fn test_dedup_cap() -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(128).expect("nonzero")
+    }
+
     #[test]
     fn append_request_has_required_fields() {
         use crate::error::Error;
@@ -367,7 +450,7 @@ mod tests {
     async fn ac1_basic_append_through_writer() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         let result = handle
@@ -391,7 +474,7 @@ mod tests {
     async fn ac2_sequential_appends_have_contiguous_positions() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
 
@@ -439,7 +522,7 @@ mod tests {
     async fn ac3_concurrent_appends_serialized() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 16, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 16, crate::broker::Broker::new(64), test_dedup_cap());
 
         let mut tasks = Vec::with_capacity(10);
         for _ in 0..10 {
@@ -474,7 +557,7 @@ mod tests {
     async fn ac4a_nostream_twice_returns_wrong_expected_version() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -509,7 +592,7 @@ mod tests {
     async fn ac4b_exact_0_after_nostream_succeeds() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -538,7 +621,7 @@ mod tests {
     async fn ac4c_exact_5_after_nostream_returns_wrong_expected_version() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -573,7 +656,7 @@ mod tests {
     async fn ac5_read_index_reflects_writes() {
         let (store, _dir) = temp_store();
         let (handle, read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         for i in 0..3u64 {
@@ -615,7 +698,7 @@ mod tests {
         {
             let store = crate::store::Store::open(&path).expect("open should succeed");
             let (handle, _read_index, join_handle) =
-                super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+                super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
             let stream_id = uuid::Uuid::new_v4();
             for _ in 0..5u64 {
@@ -651,7 +734,7 @@ mod tests {
     async fn ac7_graceful_shutdown_on_handle_drop() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         // Drop all WriterHandle clones. This closes the channel.
         drop(handle);
@@ -668,7 +751,7 @@ mod tests {
     async fn ac8_backpressure_bounded_channel() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 1, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 1, crate::broker::Broker::new(64), test_dedup_cap());
 
         // With capacity=1, the channel holds exactly one message. Fill it
         // using try_send (synchronous, non-blocking) to avoid yielding to
@@ -709,7 +792,7 @@ mod tests {
     async fn ac9a_event_too_large_returns_error() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         // Create an event whose payload exceeds MAX_EVENT_SIZE (64 KB).
         let oversized_payload = bytes::Bytes::from(vec![0u8; crate::types::MAX_EVENT_SIZE + 1]);
@@ -741,7 +824,7 @@ mod tests {
     async fn ac9b_writer_not_poisoned_after_error() {
         let (store, _dir) = temp_store();
         let (handle, _read_index, join_handle) =
-            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
 
         // First: send an oversized event that fails.
         let oversized_payload = bytes::Bytes::from(vec![0u8; crate::types::MAX_EVENT_SIZE + 1]);
@@ -786,7 +869,8 @@ mod tests {
         let broker = Broker::new(64);
         let mut rx = broker.subscribe();
 
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, broker, test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -814,7 +898,8 @@ mod tests {
         let broker = Broker::new(64);
         let mut rx = broker.subscribe();
 
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, broker, test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
         for i in 0u64..3 {
@@ -852,7 +937,8 @@ mod tests {
         let broker = Broker::new(64);
         let mut rx = broker.subscribe();
 
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, broker, test_dedup_cap());
 
         let stream_id = uuid::Uuid::new_v4();
 
@@ -884,6 +970,188 @@ mod tests {
             rx.try_recv(),
             Err(TryRecvError::Empty),
             "broker should have no events from failed append"
+        );
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    // --- Dedup integration tests (PRD 010, Ticket 2) ---
+
+    /// Helper: create a `ProposedEvent` with a specific event ID.
+    fn proposed_with_id(event_id: uuid::Uuid, event_type: &str) -> crate::types::ProposedEvent {
+        crate::types::ProposedEvent {
+            event_id,
+            event_type: event_type.to_string(),
+            metadata: bytes::Bytes::new(),
+            payload: bytes::Bytes::from_static(b"{}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_hit_returns_same_positions() {
+        let (store, _dir) = temp_store();
+        let dedup_cap = std::num::NonZeroUsize::new(128).expect("nonzero");
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), dedup_cap);
+
+        let stream_id = uuid::Uuid::new_v4();
+        let event_id = uuid::Uuid::new_v4();
+
+        // First append: creates the event.
+        let first = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("first append should succeed");
+        assert_eq!(first.len(), 1);
+
+        // Second append: identical event_id -- should be a dedup hit.
+        let second = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("dedup hit should return Ok");
+
+        // Same global_position values.
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].global_position, second[0].global_position);
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn dedup_hit_does_not_duplicate_events_in_log() {
+        let (store, _dir) = temp_store();
+        let dedup_cap = std::num::NonZeroUsize::new(128).expect("nonzero");
+        let (handle, read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), dedup_cap);
+
+        let stream_id = uuid::Uuid::new_v4();
+        let event_id = uuid::Uuid::new_v4();
+
+        // First append.
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("first append should succeed");
+
+        // Second append with same event_id (dedup hit).
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("dedup hit should return Ok");
+
+        // read_all should return exactly 1 event, not 2.
+        let all = read_index.read_all(0, 1000);
+        assert_eq!(all.len(), 1, "expected 1 event in log, got {}", all.len());
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn dedup_hit_does_not_publish_to_broker() {
+        use crate::broker::Broker;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (store, _dir) = temp_store();
+        let broker = Broker::new(64);
+        let mut rx = broker.subscribe();
+        let dedup_cap = std::num::NonZeroUsize::new(128).expect("nonzero");
+
+        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker, dedup_cap);
+
+        let stream_id = uuid::Uuid::new_v4();
+        let event_id = uuid::Uuid::new_v4();
+
+        // First append: creates the event.
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("first append should succeed");
+
+        // Drain the broker from the first (real) append.
+        let _ = rx.recv().await.expect("should receive the first event");
+
+        // Second append with same event_id (dedup hit).
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed_with_id(event_id, "TestEvent")],
+            )
+            .await
+            .expect("dedup hit should return Ok");
+
+        // The broker should NOT have received anything from the dedup hit.
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "broker should have no events from dedup hit"
+        );
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn duplicate_event_id_within_batch_rejected() {
+        let (store, _dir) = temp_store();
+        let dedup_cap = std::num::NonZeroUsize::new(128).expect("nonzero");
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), dedup_cap);
+
+        let stream_id = uuid::Uuid::new_v4();
+        let shared_id = uuid::Uuid::new_v4();
+
+        // A batch with two events sharing the same event_id is a caller error.
+        let result = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![
+                    proposed_with_id(shared_id, "EventA"),
+                    proposed_with_id(shared_id, "EventB"),
+                ],
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::error::Error::InvalidArgument(ref msg)) if msg.contains("duplicate event_id")),
+            "expected InvalidArgument with 'duplicate event_id', got: {result:?}"
+        );
+
+        // Writer should not be poisoned -- a subsequent valid append should succeed.
+        let ok_result = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::Any,
+                vec![proposed("ValidEvent")],
+            )
+            .await;
+        assert!(
+            ok_result.is_ok(),
+            "valid append after duplicate rejection should succeed"
         );
 
         drop(handle);

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use eventfold_db::proto::event_store_server::EventStoreServer;
@@ -8,11 +9,12 @@ use eventfold_db::{Broker, EventfoldService, Store, spawn_writer};
 ///
 /// # Environment Variables
 ///
-/// | Variable                   | Required | Default      | Description                        |
-/// |----------------------------|----------|--------------|------------------------------------|
-/// | `EVENTFOLD_DATA`           | Yes      | --           | Path to the append-only log file   |
-/// | `EVENTFOLD_LISTEN`         | No       | `[::]:2113`  | Socket address to listen on        |
-/// | `EVENTFOLD_BROKER_CAPACITY`| No       | `4096`       | Broadcast channel buffer size      |
+/// | Variable                    | Required | Default      | Description                        |
+/// |-----------------------------|----------|--------------|------------------------------------|
+/// | `EVENTFOLD_DATA`            | Yes      | --           | Path to the append-only log file   |
+/// | `EVENTFOLD_LISTEN`          | No       | `[::]:2113`  | Socket address to listen on        |
+/// | `EVENTFOLD_BROKER_CAPACITY` | No       | `4096`       | Broadcast channel buffer size      |
+/// | `EVENTFOLD_DEDUP_CAPACITY`  | No       | `65536`      | Max event IDs in dedup index       |
 #[derive(Debug, Clone, PartialEq)]
 struct Config {
     /// Path to the append-only event log file.
@@ -21,6 +23,8 @@ struct Config {
     listen_addr: SocketAddr,
     /// Broadcast channel ring buffer capacity for live subscriptions.
     broker_capacity: usize,
+    /// Maximum number of event IDs tracked in the dedup index.
+    dedup_capacity: NonZeroUsize,
 }
 
 /// Default socket address the server listens on when `EVENTFOLD_LISTEN` is not set.
@@ -28,6 +32,9 @@ const DEFAULT_LISTEN_ADDR: &str = "[::]:2113";
 
 /// Default broadcast channel capacity when `EVENTFOLD_BROKER_CAPACITY` is not set.
 const DEFAULT_BROKER_CAPACITY: usize = 4096;
+
+/// Default dedup capacity when `EVENTFOLD_DEDUP_CAPACITY` is not set.
+const DEFAULT_DEDUP_CAPACITY: usize = 65536;
 
 impl Config {
     /// Parse server configuration from environment variables.
@@ -38,6 +45,8 @@ impl Config {
     /// * `EVENTFOLD_LISTEN` (optional) - Socket address to listen on. Defaults to `[::]:2113`.
     /// * `EVENTFOLD_BROKER_CAPACITY` (optional) - Broadcast channel buffer size. Defaults to
     ///   `4096`.
+    /// * `EVENTFOLD_DEDUP_CAPACITY` (optional) - Max event IDs in dedup index. Defaults to
+    ///   `65536`.
     ///
     /// # Errors
     ///
@@ -45,6 +54,7 @@ impl Config {
     /// - `EVENTFOLD_DATA` is not set
     /// - `EVENTFOLD_LISTEN` is set but not a valid `SocketAddr`
     /// - `EVENTFOLD_BROKER_CAPACITY` is set but not a valid `usize`
+    /// - `EVENTFOLD_DEDUP_CAPACITY` is set but not a valid nonzero `usize`
     fn from_env() -> Result<Config, String> {
         let data_path = std::env::var("EVENTFOLD_DATA")
             .map(PathBuf::from)
@@ -66,10 +76,23 @@ impl Config {
             Err(_) => DEFAULT_BROKER_CAPACITY,
         };
 
+        let dedup_capacity = match std::env::var("EVENTFOLD_DEDUP_CAPACITY") {
+            Ok(val) => {
+                let raw: usize = val
+                    .parse()
+                    .map_err(|e| format!("EVENTFOLD_DEDUP_CAPACITY is not a valid usize: {e}"))?;
+                NonZeroUsize::new(raw)
+                    .ok_or_else(|| "EVENTFOLD_DEDUP_CAPACITY must be nonzero".to_string())?
+            }
+            Err(_) => NonZeroUsize::new(DEFAULT_DEDUP_CAPACITY)
+                .expect("default dedup capacity is nonzero"),
+        };
+
         Ok(Config {
             data_path,
             listen_addr,
             broker_capacity,
+            dedup_capacity,
         })
     }
 }
@@ -153,7 +176,9 @@ async fn main() {
     let broker = Broker::new(config.broker_capacity);
 
     // 6. Spawn the writer task.
-    let (writer_handle, read_index, join_handle) = spawn_writer(store, 64, broker.clone());
+    tracing::info!(dedup_capacity = %config.dedup_capacity, "Dedup capacity");
+    let (writer_handle, read_index, join_handle) =
+        spawn_writer(store, 64, broker.clone(), config.dedup_capacity);
 
     // 7. Build the EventfoldService.
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
@@ -211,6 +236,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let config = Config::from_env().expect("should succeed with EVENTFOLD_DATA set");
         assert_eq!(config.data_path, PathBuf::from("/tmp/x"));
@@ -219,6 +245,7 @@ mod tests {
             "[::]:2113".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(config.broker_capacity, 4096);
+        assert_eq!(config.dedup_capacity.get(), 65536);
     }
 
     #[test]
@@ -228,6 +255,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DATA") };
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when EVENTFOLD_DATA is unset");
@@ -245,6 +273,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
         unsafe { std::env::set_var("EVENTFOLD_LISTEN", "127.0.0.1:9999") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
@@ -260,6 +289,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "16") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(config.broker_capacity, 16);
@@ -272,6 +302,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
         unsafe { std::env::set_var("EVENTFOLD_LISTEN", "not-an-addr") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid listen address");
@@ -291,6 +322,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "not-a-number") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid broker capacity");

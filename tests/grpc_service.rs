@@ -3,14 +3,20 @@
 //! Each test spins up a real tonic server on an ephemeral port using
 //! `start_test_server`, connects a gRPC client, and exercises the RPCs.
 
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+
 use eventfold_db::proto::event_store_client::EventStoreClient;
 use eventfold_db::proto::event_store_server::EventStoreServer;
 use eventfold_db::proto::{self, expected_version};
 use eventfold_db::{Broker, EventfoldService, Store, spawn_writer};
-
-use std::net::SocketAddr;
 use tempfile::TempDir;
 use tonic::transport::Channel;
+
+/// Default dedup capacity for integration tests.
+fn test_dedup_cap() -> NonZeroUsize {
+    NonZeroUsize::new(128).expect("nonzero")
+}
 
 /// Spin up an in-process gRPC server on an ephemeral port and return a connected
 /// client, the server address, and the temp directory holding the event log.
@@ -30,7 +36,8 @@ async fn start_test_server_with_broker_capacity(
     let path = dir.path().join("events.log");
     let store = Store::open(&path).expect("open should succeed");
     let broker = Broker::new(broker_capacity);
-    let (writer_handle, read_index, _join_handle) = spawn_writer(store, 64, broker.clone());
+    let (writer_handle, read_index, _join_handle) =
+        spawn_writer(store, 64, broker.clone(), test_dedup_cap());
 
     let service = EventfoldService::new(writer_handle, read_index, broker);
 

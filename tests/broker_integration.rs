@@ -5,11 +5,18 @@
 //! spawn a writer with a broker, append events across multiple streams, and consume them
 //! through subscription streams.
 
+use std::num::NonZeroUsize;
+
 use eventfold_db::{
     Broker, ExpectedVersion, ProposedEvent, Store, SubscriptionMessage, WriterHandle, spawn_writer,
     subscribe_all, subscribe_stream,
 };
 use futures::StreamExt;
+
+/// Default dedup capacity for integration tests.
+fn test_dedup_cap() -> NonZeroUsize {
+    NonZeroUsize::new(128).expect("nonzero")
+}
 
 /// Helper: create a `ProposedEvent` with minimal fields for testing.
 fn proposed(event_type: &str) -> ProposedEvent {
@@ -54,7 +61,8 @@ async fn append_n(handle: &WriterHandle, stream_id: uuid::Uuid, n: u64) {
 async fn subscribe_all_and_subscribe_stream_full_flow() {
     let (store, _dir) = temp_store();
     let broker = Broker::new(64);
-    let (handle, read_index, join_handle) = spawn_writer(store, 8, broker.clone());
+    let (handle, read_index, join_handle) =
+        spawn_writer(store, 8, broker.clone(), test_dedup_cap());
 
     let stream_x = uuid::Uuid::new_v4();
     let stream_y = uuid::Uuid::new_v4();
@@ -115,7 +123,8 @@ async fn subscribe_all_and_subscribe_stream_full_flow() {
 async fn caught_up_is_yielded_after_catchup_events_before_live() {
     let (store, _dir) = temp_store();
     let broker = Broker::new(64);
-    let (handle, read_index, join_handle) = spawn_writer(store, 8, broker.clone());
+    let (handle, read_index, join_handle) =
+        spawn_writer(store, 8, broker.clone(), test_dedup_cap());
 
     let stream_id = uuid::Uuid::new_v4();
 

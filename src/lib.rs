@@ -2,6 +2,7 @@
 
 pub mod broker;
 pub mod codec;
+pub(crate) mod dedup;
 pub mod error;
 /// Generated protobuf types for the EventfoldDB gRPC API.
 pub mod proto {
