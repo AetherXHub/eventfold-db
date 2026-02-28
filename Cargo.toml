@@ -16,6 +16,8 @@ rust-version = "1.85"
 
 [dependencies]
 async-stream = "0.3"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 bytes = "1"
 futures-core = "0.3"

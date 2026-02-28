@@ -544,5 +544,4 @@ async fn metrics_custom_port_via_env() {
         first_line.contains("200"),
         "metrics server on custom port should return 200, got: {first_line}"
     );
-
 }

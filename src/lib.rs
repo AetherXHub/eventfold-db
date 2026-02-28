@@ -73,6 +73,7 @@
 //! environment, opens the store, and starts the gRPC server -- suitable for
 //! running EventfoldDB as a standalone service.
 
+pub mod auth;
 pub mod broker;
 pub mod codec;
 pub(crate) mod dedup;

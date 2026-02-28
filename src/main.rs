@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use eventfold_db::auth::JwtInterceptor;
 use eventfold_db::proto::event_store_server::EventStoreServer;
 use eventfold_db::{Broker, EventfoldService, Store, spawn_writer};
+use tonic::service::interceptor::InterceptedService;
 
 /// Optional TLS configuration parsed from environment variables.
 ///
@@ -34,6 +36,7 @@ struct TlsConfig {
 /// | `EVENTFOLD_TLS_KEY`         | No       | --           | PEM key path (required with CERT)    |
 /// | `EVENTFOLD_TLS_CA`          | No       | --           | PEM CA path (enables mTLS)           |
 /// | `EVENTFOLD_METRICS_LISTEN`  | No       | `[::]:9090`  | Metrics HTTP address; empty disables |
+/// | `EVENTFOLD_JWT_SECRET`      | No       | --           | HS256 JWT signing secret; auth disabled when unset |
 #[derive(Debug, Clone, PartialEq)]
 struct Config {
     /// Path to the append-only event log file.
@@ -49,6 +52,9 @@ struct Config {
     /// Socket address for the Prometheus metrics HTTP endpoint.
     /// `None` disables the metrics endpoint entirely.
     metrics_listen: Option<SocketAddr>,
+    /// HS256 JWT signing secret for authenticating gRPC requests.
+    /// `None` means auth is disabled (all requests are accepted).
+    jwt_secret: Option<String>,
 }
 
 /// Default socket address the server listens on when `EVENTFOLD_LISTEN` is not set.
@@ -174,6 +180,12 @@ impl Config {
             }
         };
 
+        // Parse optional JWT secret. Empty string is treated as unset.
+        let jwt_secret = match std::env::var("EVENTFOLD_JWT_SECRET") {
+            Ok(val) if !val.is_empty() => Some(val),
+            _ => None,
+        };
+
         Ok(Config {
             data_path,
             listen_addr,
@@ -181,6 +193,7 @@ impl Config {
             dedup_capacity,
             tls,
             metrics_listen,
+            jwt_secret,
         })
     }
 }
@@ -289,7 +302,14 @@ async fn main() {
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // 10. Build the tonic Server, optionally with TLS.
+    // 10. Log JWT auth status before building the server.
+    if config.jwt_secret.is_none() {
+        tracing::warn!(
+            "JWT auth is disabled -- all requests will be accepted without authentication"
+        );
+    }
+
+    // 11. Build the tonic Server, optionally with TLS.
     let mut builder = tonic::transport::Server::builder();
 
     if let Some(ref tls) = config.tls {
@@ -336,11 +356,18 @@ async fn main() {
         });
     }
 
-    let server = builder
-        .add_service(health_service)
-        .add_service(EventStoreServer::new(service));
+    // 12. Add services, conditionally wrapping with JWT interceptor.
+    let router = builder.add_service(health_service);
+    let server = match config.jwt_secret {
+        Some(ref secret) => {
+            let interceptor = JwtInterceptor::new(secret);
+            let svc = InterceptedService::new(EventStoreServer::new(service), interceptor);
+            router.add_service(svc)
+        }
+        None => router.add_service(EventStoreServer::new(service)),
+    };
 
-    // 11. Bind on the configured address.
+    // 13. Bind on the configured address.
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .unwrap_or_else(|e| {
@@ -358,10 +385,10 @@ async fn main() {
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
-    // 12. Log the actual bound address.
+    // 14. Log the actual bound address.
     tracing::info!("Server listening on {addr}");
 
-    // 13. Mark health service as SERVING now that the listener is bound.
+    // 15. Mark health service as SERVING now that the listener is bound.
     health_reporter
         .set_serving::<EventStoreServer<EventfoldService>>()
         .await;
@@ -369,7 +396,7 @@ async fn main() {
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
 
-    // 14-15. Serve until shutdown signal, then clean up.
+    // 16-17. Serve until shutdown signal, then clean up.
     // The shutdown future transitions health status to NOT_SERVING before the
     // server begins draining connections.
     server
@@ -420,6 +447,12 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_METRICS_LISTEN") };
     }
 
+    /// Clear the JWT-related environment variable so it does not leak between tests.
+    fn clear_jwt_env() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::remove_var("EVENTFOLD_JWT_SECRET") };
+    }
+
     #[test]
     #[serial]
     fn from_env_defaults_when_only_data_set() {
@@ -430,6 +463,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed with EVENTFOLD_DATA set");
         assert_eq!(config.data_path, PathBuf::from("/tmp/x"));
@@ -451,6 +485,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when EVENTFOLD_DATA is unset");
@@ -471,6 +506,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
@@ -489,6 +525,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(config.broker_capacity, 16);
@@ -504,6 +541,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid listen address");
@@ -526,6 +564,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid broker capacity");
@@ -541,6 +580,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed without TLS vars");
         assert_eq!(config.tls, None);
@@ -558,6 +598,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(
@@ -587,6 +628,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when CERT is missing");
@@ -609,6 +651,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
         clear_metrics_env();
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when KEY is missing");
@@ -631,6 +674,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed with cert, key, and CA");
         assert_eq!(
@@ -655,6 +699,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed with cert and key");
         assert_eq!(
@@ -758,6 +803,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         clear_metrics_env();
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
@@ -776,6 +822,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "") };
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(config.metrics_listen, None);
@@ -791,12 +838,61 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "127.0.0.1:19090") };
+        clear_jwt_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
             config.metrics_listen,
             Some("127.0.0.1:19090".parse::<SocketAddr>().unwrap())
         );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_jwt_secret_set() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        clear_metrics_env();
+        unsafe { std::env::set_var("EVENTFOLD_JWT_SECRET", "mysecret") };
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(config.jwt_secret, Some("mysecret".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_jwt_secret_unset() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        clear_metrics_env();
+        clear_jwt_env();
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(config.jwt_secret, None);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_jwt_secret_empty_string() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        clear_metrics_env();
+        unsafe { std::env::set_var("EVENTFOLD_JWT_SECRET", "") };
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(config.jwt_secret, None);
     }
 
     #[test]
@@ -809,6 +905,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
         unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "not-an-addr") };
+        clear_jwt_env();
 
         let result = Config::from_env();
         assert!(
